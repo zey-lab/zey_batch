@@ -1,0 +1,77 @@
+# SMS Campaign Manager Configuration
+
+# File Paths (relative to project root)
+paths:
+  data_folder: "data"
+  config_folder: "config"
+  logs_folder: "logs"
+  archive_folder: "data/archive"
+  delete_temp_folder: "data/delete_temp"
+
+# File Names
+files:
+  customers_list_old: "CustomersList_old.xlsx"
+  customers_list_new: "CustomersList.xlsx"
+  campaign_config: "campaigns.xlsx"
+
+# Phone Number Configuration
+phone:
+  column_name: "Mobile"
+
+# SMS Settings
+sms:
+  dry_run: false
+  rate_limit_delay: 1.0
+  max_retries: 3
+  retry_delay: 2
+
+# Customer List Column Mappings
+customer_columns:
+  phone_number: "Mobile"
+  last_sms_sent_date: "last_sms_sent_date"
+  last_sms_status: "last_sms_status"
+  last_visit_date: "Last Visited"
+  birthday: "Birthdate"
+  customer_since: "Customer Since"
+  first_name: "First Name"
+  last_name: "Last Name"
+  sms_opt_out: "SMS_Opt_Out"
+  opt_out_date: "Opt_Out_Date"
+
+# Campaign Configuration Column Mappings
+campaign_columns:
+  text_prompt: "Text/Prompt"
+  character_limit: "SMS Text Character Limit"
+  campaign_type: "Type (Campaing / Reminder)"
+  filter_last_visit_days: "Filter-Last Visit Days"
+  filter_last_sms_days: "Filter-Last SMS Day"
+  process_date: "Campaign Process Date"
+  process_status: "Campaign Process Status"
+
+# Campaign Types
+campaign_types:
+  birthday: "Birthday"
+  anniversary: "Anniversary"
+  campaign: "Campaign"
+  reminder: "Reminder"
+
+# Status Values
+status_values:
+  sent: "sent"
+  processing: "processing"
+  failed: "failed"
+  pending: "pending"
+
+# Date Formats
+date_formats:
+  input: "%Y-%m-%d"
+  output: "%Y-%m-%d %H:%M:%S"
+  display: "%B %d, %Y %I:%M %p"
+
+# File Processing
+file_processing:
+  backup_old_files: true
+  archive_processed_files: true
+  supported_formats:
+    - xlsx
+    - csv
