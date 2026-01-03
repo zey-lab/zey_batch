@@ -163,13 +163,20 @@ class CampaignProcessor:
     def get_pending_campaigns(self, campaigns: List[Campaign]) -> List[Campaign]:
         """Get campaigns that haven't been processed yet.
 
+        Note: Only 'Announce' campaigns are filtered by processed status.
+        Other campaigns (Campaign, Reminder, etc.) are always considered pending
+        as they run continuously based on customer criteria.
+
         Args:
             campaigns: List of all campaigns
 
         Returns:
             List of unprocessed campaigns
         """
-        return [c for c in campaigns if not c.is_processed()]
+        return [
+            c for c in campaigns 
+            if not c.is_announce_campaign() or not c.is_processed()
+        ]
 
     def filter_customers_for_campaign(
         self,
