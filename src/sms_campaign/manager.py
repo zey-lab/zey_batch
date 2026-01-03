@@ -140,8 +140,8 @@ class CampaignManager:
         self.logger.stat("Total campaigns", len(campaigns))
 
         # Get pending campaigns
-        # pending = self.campaign_processor.get_pending_campaigns(campaigns)
-        # self.logger.stat("Pending campaigns", len(pending))
+        pending = self.campaign_processor.get_pending_campaigns(campaigns)
+        self.logger.stat("Pending campaigns", len(pending))
 
         return campaigns
 
@@ -453,8 +453,8 @@ class CampaignManager:
             campaigns = self.load_campaigns()
 
             # Get pending campaigns
-            # pending_campaigns = self.campaign_processor.get_pending_campaigns(campaigns)
-            pending_campaigns = campaigns
+            pending_campaigns = self.campaign_processor.get_pending_campaigns(campaigns)
+            # pending_campaigns = campaigns
             
             # Sort campaigns by Rank (ascending)
             # Lower rank number = Higher priority (e.g., 1 is processed before 2)
