@@ -108,6 +108,16 @@ class Campaign:
             return False
         return 'anniversary' in str(self.campaign_type).lower()
 
+    def is_announce_campaign(self) -> bool:
+        """Check if this is an announce campaign.
+
+        Returns:
+            True if campaign type is Announce
+        """
+        if not self.campaign_type:
+            return False
+        return 'announce' in str(self.campaign_type).lower()
+
     def __repr__(self) -> str:
         """String representation of campaign."""
         return f"Campaign(row={self.row_index}, type={self.campaign_type}, processed={self.is_processed()})"
@@ -205,9 +215,9 @@ class CampaignProcessor:
             print(f"DEBUG: After last visit filter ({campaign.filter_last_visit_days} days): {len(filtered_df)} customers. Sample data:")
             print(filtered_df.head())
 
-        # Apply last SMS filter (unless it's a birthday or anniversary campaign)
+        # Apply last SMS filter (unless it's a birthday, anniversary, or announce campaign)
         if campaign.filter_last_sms_days is not None and self.last_sms_sent_col in filtered_df.columns:
-            if not campaign.is_birthday_campaign() and not campaign.is_anniversary_campaign():
+            if not campaign.is_birthday_campaign() and not campaign.is_anniversary_campaign() and not campaign.is_announce_campaign():
                 filtered_df = self._filter_by_last_sms(filtered_df, campaign.filter_last_sms_days)
                 print(f"DEBUG: After last SMS filter ({campaign.filter_last_sms_days} days): {len(filtered_df)} customers. Sample data:")
                 print(filtered_df.head())

@@ -257,12 +257,12 @@ class CampaignManager:
                 self.merged_customers_df[phone_col] == phone
             ].index[0]
 
-            # Update Last SMS Date for ALL campaigns (including Birthday)
+            # Update Last SMS Date for ALL campaigns (except Announce)
             # This ensures we track activity correctly.
             # The "Rank" logic handles the exclusion of customers from subsequent campaigns in the same run.
-            self.merged_customers_df.at[customer_idx, sms_date_col] = datetime.now()
-            
-            self.merged_customers_df.at[customer_idx, sms_status_col] = status
+            if not campaign.is_announce_campaign():
+                self.merged_customers_df.at[customer_idx, sms_date_col] = datetime.now()
+                self.merged_customers_df.at[customer_idx, sms_status_col] = status
 
             if success:
                 sent_count += 1
