@@ -45,6 +45,7 @@ campaign_columns:
   campaign_type: "Type (Campaing / Reminder)"
   filter_last_visit_days: "Filter-Last Visit Days"
   filter_last_sms_days: "Filter-Last SMS Day"
+  rank: "Rank"
   process_date: "Campaign Process Date"
   process_status: "Campaign Process Status"
 

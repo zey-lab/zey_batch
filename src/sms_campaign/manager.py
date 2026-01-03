@@ -59,6 +59,7 @@ class CampaignManager:
         # State
         self.merged_customers_df: Optional[pd.DataFrame] = None
         self.campaigns_df: Optional[pd.DataFrame] = None
+        self.sent_phones_this_run: set = set()  # Track phones sent in this execution
 
     def check_files(self) -> dict:
         """Check status of required files.
@@ -171,6 +172,18 @@ class CampaignManager:
         # Log count after campaign filters
         self.logger.stat("Customers after campaign filters", len(eligible_customers))
 
+        # Filter out customers who have already received an SMS in this run
+        # This enforces the "Rank" logic: higher ranked campaigns get first dibs
+        phone_col = self.config.phone_number_column
+        if self.sent_phones_this_run:
+            before_dedup = len(eligible_customers)
+            eligible_customers = eligible_customers[
+                ~eligible_customers[phone_col].isin(self.sent_phones_this_run)
+            ]
+            dedup_count = before_dedup - len(eligible_customers)
+            if dedup_count > 0:
+                self.logger.info(f"Excluded {dedup_count} customers who were already messaged by a higher-ranked campaign in this run.")
+
         # Apply test phone number filter if configured
         test_numbers = self.config.test_phone_numbers
         if test_numbers:
@@ -244,11 +257,18 @@ class CampaignManager:
                 self.merged_customers_df[phone_col] == phone
             ].index[0]
 
+            # Update Last SMS Date for ALL campaigns (including Birthday)
+            # This ensures we track activity correctly.
+            # The "Rank" logic handles the exclusion of customers from subsequent campaigns in the same run.
             self.merged_customers_df.at[customer_idx, sms_date_col] = datetime.now()
+            
             self.merged_customers_df.at[customer_idx, sms_status_col] = status
 
             if success:
                 sent_count += 1
+                # Add to set of sent phones for this run to prevent duplicate sends
+                self.sent_phones_this_run.add(phone)
+                
                 if sent_count % 10 == 0:
                     self.logger.info(f"Progress: {sent_count}/{eligible_count} sent")
             else:
@@ -435,6 +455,11 @@ class CampaignManager:
             # Get pending campaigns
             # pending_campaigns = self.campaign_processor.get_pending_campaigns(campaigns)
             pending_campaigns = campaigns
+            
+            # Sort campaigns by Rank (ascending)
+            # Lower rank number = Higher priority (e.g., 1 is processed before 2)
+            pending_campaigns.sort(key=lambda c: c.rank)
+            
             if not pending_campaigns:
                 self.logger.warning("No pending campaigns to process")
                 return {

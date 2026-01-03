@@ -28,10 +28,17 @@ class Campaign:
         self.campaign_type = self._get_field('campaign_type', 'Campaign')
         self.filter_last_visit_days = self._get_field('filter_last_visit_days', None)
         self.filter_last_sms_days = self._get_field('filter_last_sms_days', None)
+        self.rank = self._get_field('rank', 999)  # Default to high number (low priority)
         self.process_date = self._get_field('process_date', None)
         self.process_status = self._get_field('process_status', None)
 
         # Parse numeric filters
+        if self.rank is not None:
+            try:
+                self.rank = int(float(self.rank))
+            except (ValueError, TypeError):
+                self.rank = 999
+
         if self.filter_last_visit_days is not None:
             try:
                 self.filter_last_visit_days = int(float(self.filter_last_visit_days))
@@ -195,23 +202,30 @@ class CampaignProcessor:
         # Apply last visit filter
         if campaign.filter_last_visit_days is not None and self.last_visit_col in filtered_df.columns:
             filtered_df = self._filter_by_last_visit(filtered_df, campaign.filter_last_visit_days)
-            print(f"DEBUG: After last visit filter ({campaign.filter_last_visit_days} days): {len(filtered_df)} customers")
+            print(f"DEBUG: After last visit filter ({campaign.filter_last_visit_days} days): {len(filtered_df)} customers. Sample data:")
+            print(filtered_df.head())
 
         # Apply last SMS filter (unless it's a birthday or anniversary campaign)
         if campaign.filter_last_sms_days is not None and self.last_sms_sent_col in filtered_df.columns:
             if not campaign.is_birthday_campaign() and not campaign.is_anniversary_campaign():
                 filtered_df = self._filter_by_last_sms(filtered_df, campaign.filter_last_sms_days)
-                print(f"DEBUG: After last SMS filter ({campaign.filter_last_sms_days} days): {len(filtered_df)} customers")
+                print(f"DEBUG: After last SMS filter ({campaign.filter_last_sms_days} days): {len(filtered_df)} customers. Sample data:")
+                print(filtered_df.head())
 
         # For birthday campaigns, filter by birthday
         if campaign.is_birthday_campaign() and self.birthday_col in filtered_df.columns:
-            filtered_df = self._filter_by_birthday(filtered_df)
-            print(f"DEBUG: After birthday filter: {len(filtered_df)} customers")
+            # Use filter_last_sms_days as the offset (default to 0 if not set)
+            # If set to 7, we look for birthdays 7 days from now (send 7 days before birthday)
+            offset = campaign.filter_last_sms_days if campaign.filter_last_sms_days is not None else 0
+            filtered_df = self._filter_by_birthday(filtered_df, days_offset=offset)
+            print(f"DEBUG: After birthday filter (offset {offset} days): {len(filtered_df)} customers. Sample data:")
+            print(filtered_df.head())
 
         # For anniversary campaigns, filter by customer anniversary
         if campaign.is_anniversary_campaign() and self.customer_since_col in filtered_df.columns:
             filtered_df = self._filter_by_anniversary(filtered_df)
-            print(f"DEBUG: After anniversary filter: {len(filtered_df)} customers")
+            print(f"DEBUG: After anniversary filter: {len(filtered_df)} customers. Sample data:")
+            print(filtered_df.head())
 
         return filtered_df
 
@@ -290,28 +304,30 @@ class CampaignProcessor:
 
         return df[df[self.last_sms_sent_col].apply(should_include)].copy()
 
-    def _filter_by_birthday(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Filter customers whose birthday is today.
+    def _filter_by_birthday(self, df: pd.DataFrame, days_offset: int = 0) -> pd.DataFrame:
+        """Filter customers whose birthday is today + offset.
 
         Args:
             df: Customer DataFrame
+            days_offset: Number of days from now to check for birthday. 
+                         If 7, checks if birthday is 7 days from now.
 
         Returns:
             Filtered DataFrame with birthday customers
         """
-        today = datetime.now()
+        target_date = datetime.now() + timedelta(days=days_offset)
 
-        def is_birthday_today(birthday):
+        def is_birthday_target(birthday):
             if pd.isna(birthday):
                 return False
             try:
                 # Compare month and day only
                 bday = pd.to_datetime(birthday)
-                return bday.month == today.month and bday.day == today.day
+                return bday.month == target_date.month and bday.day == target_date.day
             except:
                 return False
 
-        return df[df[self.birthday_col].apply(is_birthday_today)].copy()
+        return df[df[self.birthday_col].apply(is_birthday_target)].copy()
 
     def _filter_by_anniversary(self, df: pd.DataFrame) -> pd.DataFrame:
         """Filter customers whose membership anniversary is today.
