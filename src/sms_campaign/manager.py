@@ -174,8 +174,9 @@ class CampaignManager:
 
         # Filter out customers who have already received an SMS in this run
         # This enforces the "Rank" logic: higher ranked campaigns get first dibs
+        # Note: Announce campaigns are excluded from this logic (they don't respect rank)
         phone_col = self.config.phone_number_column
-        if self.sent_phones_this_run:
+        if not campaign.is_announce_campaign() and self.sent_phones_this_run:
             before_dedup = len(eligible_customers)
             eligible_customers = eligible_customers[
                 ~eligible_customers[phone_col].isin(self.sent_phones_this_run)
@@ -267,7 +268,9 @@ class CampaignManager:
             if success:
                 sent_count += 1
                 # Add to set of sent phones for this run to prevent duplicate sends
-                self.sent_phones_this_run.add(phone)
+                # Note: Announce campaigns do not block other campaigns, so we don't add them here
+                if not campaign.is_announce_campaign():
+                    self.sent_phones_this_run.add(phone)
                 
                 if sent_count % 10 == 0:
                     self.logger.info(f"Progress: {sent_count}/{eligible_count} sent")
