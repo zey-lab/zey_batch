@@ -25,6 +25,7 @@ class CustomerDataMerger:
         self.last_sms_status_col = config.get('last_sms_status', 'last_sms_status')
         self.opt_out_col = config.get('sms_opt_out', 'SMS_Opt_Out')
         self.opt_out_date_col = config.get('opt_out_date', 'Opt_Out_Date')
+        self.last_review_sent_col = config.get('last_review_sent_date', 'last_review_sent_date')
 
     def merge_customer_lists(
         self,
@@ -53,6 +54,8 @@ class CustomerDataMerger:
                 merged_df[self.last_sms_sent_col] = pd.NaT
             if self.last_sms_status_col not in merged_df.columns:
                 merged_df[self.last_sms_status_col] = None
+            if self.last_review_sent_col not in merged_df.columns:
+                merged_df[self.last_review_sent_col] = pd.NaT
             return merged_df
 
         # Ensure phone column exists in both dataframes
@@ -94,6 +97,9 @@ class CustomerDataMerger:
                     if self.opt_out_date_col not in merged_df.columns:
                         merged_df[self.opt_out_date_col] = None
                     merged_df.loc[old_opt_outs, self.opt_out_date_col] = old_dates
+
+        # Ensure index name is preserved before resetting
+        merged_df.index.name = self.phone_column
 
         # Reset index to make phone number a column again
         merged_df = merged_df.reset_index()

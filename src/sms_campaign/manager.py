@@ -187,7 +187,7 @@ class CampaignManager:
 
         # Apply test phone number filter if configured
         test_numbers = self.config.test_phone_numbers
-        if test_numbers:
+        if test_numbers and not eligible_customers.empty:
             # Normalize test numbers using the same logic as customer data
             normalized_test_numbers = []
             for num in test_numbers:
@@ -237,12 +237,19 @@ class CampaignManager:
         phone_col = self.config.phone_number_column
         sms_date_col = self.customer_merger.last_sms_sent_col
         sms_status_col = self.customer_merger.last_sms_status_col
+        review_sent_col = self.campaign_processor.last_review_sent_col
 
         # Ensure columns are object type to avoid FutureWarning
         if self.merged_customers_df[sms_date_col].dtype == 'float64':
             self.merged_customers_df[sms_date_col] = self.merged_customers_df[sms_date_col].astype('object')
         if self.merged_customers_df[sms_status_col].dtype == 'float64':
             self.merged_customers_df[sms_status_col] = self.merged_customers_df[sms_status_col].astype('object')
+        
+        # Ensure review column exists
+        if review_sent_col not in self.merged_customers_df.columns:
+            self.merged_customers_df[review_sent_col] = pd.NaT
+        if self.merged_customers_df[review_sent_col].dtype == 'float64':
+            self.merged_customers_df[review_sent_col] = self.merged_customers_df[review_sent_col].astype('object')
 
         for idx, customer_row in eligible_customers.iterrows():
             phone = customer_row[phone_col]
@@ -264,6 +271,10 @@ class CampaignManager:
             if not campaign.is_announce_campaign():
                 self.merged_customers_df.at[customer_idx, sms_date_col] = datetime.now()
                 self.merged_customers_df.at[customer_idx, sms_status_col] = status
+
+            # For Review campaigns, update the review sent date to prevent future sends
+            if success and campaign.is_review_campaign():
+                self.merged_customers_df.at[customer_idx, review_sent_col] = datetime.now()
 
             if success:
                 sent_count += 1

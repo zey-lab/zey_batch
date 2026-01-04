@@ -118,6 +118,16 @@ class Campaign:
             return False
         return 'announce' in str(self.campaign_type).lower()
 
+    def is_review_campaign(self) -> bool:
+        """Check if this is a review campaign.
+
+        Returns:
+            True if campaign type is Review
+        """
+        if not self.campaign_type:
+            return False
+        return 'review' in str(self.campaign_type).lower()
+
     def __repr__(self) -> str:
         """String representation of campaign."""
         return f"Campaign(row={self.row_index}, type={self.campaign_type}, processed={self.is_processed()})"
@@ -142,6 +152,7 @@ class CampaignProcessor:
         self.customer_since_col = customer_columns.get('customer_since', 'customer_since')
         self.first_name_col = customer_columns.get('first_name', 'first_name')
         self.opt_out_col = customer_columns.get('sms_opt_out', 'SMS_Opt_Out')
+        self.last_review_sent_col = customer_columns.get('last_review_sent_date', 'last_review_sent_date')
 
     def load_campaigns(self, df: pd.DataFrame) -> List[Campaign]:
         """Load campaigns from DataFrame.
@@ -216,15 +227,30 @@ class CampaignProcessor:
         if self.customer_since_col in filtered_df.columns:
             filtered_df = self._parse_date_column(filtered_df, self.customer_since_col)
 
+        if self.last_review_sent_col in filtered_df.columns:
+            filtered_df = self._parse_date_column(filtered_df, self.last_review_sent_col)
+
         # Apply last visit filter
         if campaign.filter_last_visit_days is not None and self.last_visit_col in filtered_df.columns:
-            filtered_df = self._filter_by_last_visit(filtered_df, campaign.filter_last_visit_days)
-            print(f"DEBUG: After last visit filter ({campaign.filter_last_visit_days} days): {len(filtered_df)} customers. Sample data:")
-            print(filtered_df.head())
+            print(f"DEBUG: Checking Last Visit Filter. Type: '{campaign.campaign_type}', Is Review: {campaign.is_review_campaign()}, Days: {campaign.filter_last_visit_days}")
+            
+            if campaign.is_review_campaign():
+                # For review campaigns, we want customers who visited RECENTLY (within last N days)
+                filtered_df = self._filter_by_recent_visit(filtered_df, campaign.filter_last_visit_days)
+                print(f"DEBUG: After recent visit filter (within {campaign.filter_last_visit_days} days): {len(filtered_df)} customers.")
+            else:
+                # For other campaigns (retention), we want customers who visited LONG AGO (more than N days)
+                filtered_df = self._filter_by_last_visit(filtered_df, campaign.filter_last_visit_days)
+                print(f"DEBUG: After last visit filter (older than {campaign.filter_last_visit_days} days): {len(filtered_df)} customers.")
+            
+            if not filtered_df.empty:
+                print("Sample dates:")
+                print(filtered_df[[self.last_visit_col]].head())
 
-        # Apply last SMS filter (unless it's a birthday, anniversary, or announce campaign)
+        # Apply last SMS filter (unless it's a birthday, anniversary, announce, or review campaign)
+        # Review campaigns have their own strict "never again" filter, but don't care about recent generic SMS
         if campaign.filter_last_sms_days is not None and self.last_sms_sent_col in filtered_df.columns:
-            if not campaign.is_birthday_campaign() and not campaign.is_anniversary_campaign() and not campaign.is_announce_campaign():
+            if not campaign.is_birthday_campaign() and not campaign.is_anniversary_campaign() and not campaign.is_announce_campaign() and not campaign.is_review_campaign():
                 filtered_df = self._filter_by_last_sms(filtered_df, campaign.filter_last_sms_days)
                 print(f"DEBUG: After last SMS filter ({campaign.filter_last_sms_days} days): {len(filtered_df)} customers. Sample data:")
                 print(filtered_df.head())
@@ -242,6 +268,12 @@ class CampaignProcessor:
         if campaign.is_anniversary_campaign() and self.customer_since_col in filtered_df.columns:
             filtered_df = self._filter_by_anniversary(filtered_df)
             print(f"DEBUG: After anniversary filter: {len(filtered_df)} customers. Sample data:")
+            print(filtered_df.head())
+
+        # For review campaigns, filter by review eligibility (never received before)
+        if campaign.is_review_campaign():
+            filtered_df = self._filter_by_review_eligibility(filtered_df)
+            print(f"DEBUG: After review eligibility filter: {len(filtered_df)} customers. Sample data:")
             print(filtered_df.head())
 
         return filtered_df
@@ -289,13 +321,45 @@ class CampaignProcessor:
         Returns:
             Filtered DataFrame
         """
+        if df.empty:
+            return df
+
         now = datetime.now()
-        threshold = now - timedelta(days=days)
+        # Normalize to midnight to compare dates only (avoid time-of-day issues)
+        today_midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        threshold = today_midnight - timedelta(days=days)
 
         def should_include(last_visit):
             if pd.isna(last_visit):
                 return True  # Include if no visit recorded
             return last_visit <= threshold
+
+        return df[df[self.last_visit_col].apply(should_include)].copy()
+
+    def _filter_by_recent_visit(self, df: pd.DataFrame, days: int) -> pd.DataFrame:
+        """Filter by recent visit date.
+
+        Only include customers who visited WITHIN the last N days.
+
+        Args:
+            df: Customer DataFrame
+            days: Number of days threshold
+
+        Returns:
+            Filtered DataFrame
+        """
+        if df.empty:
+            return df
+
+        now = datetime.now()
+        # Normalize to midnight to compare dates only (avoid time-of-day issues)
+        today_midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        threshold = today_midnight - timedelta(days=days)
+
+        def should_include(last_visit):
+            if pd.isna(last_visit):
+                return False  # Must have visited recently
+            return last_visit >= threshold
 
         return df[df[self.last_visit_col].apply(should_include)].copy()
 
@@ -311,6 +375,9 @@ class CampaignProcessor:
         Returns:
             Filtered DataFrame
         """
+        if df.empty:
+            return df
+
         now = datetime.now()
         threshold = now - timedelta(days=days)
 
@@ -368,6 +435,28 @@ class CampaignProcessor:
                 return False
 
         return df[df[self.customer_since_col].apply(is_anniversary_today)].copy()
+
+    def _filter_by_review_eligibility(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Filter customers who have never received a review request.
+
+        Args:
+            df: Customer DataFrame
+
+        Returns:
+            Filtered DataFrame
+        """
+        # If column doesn't exist, everyone is eligible (assuming other filters pass)
+        if self.last_review_sent_col not in df.columns:
+            return df
+
+        def has_received_review(date_val):
+            # If date is NaT/None/NaN, they haven't received it -> Eligible
+            if pd.isna(date_val):
+                return False
+            # If there is a date, they HAVE received it -> Not Eligible
+            return True
+
+        return df[~df[self.last_review_sent_col].apply(has_received_review)].copy()
 
     def generate_message(self, campaign: Campaign, customer_row: pd.Series) -> str:
         """Generate personalized message for a customer.
