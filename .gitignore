@@ -20,6 +20,9 @@ wheels/
 .installed.cfg
 *.egg
 
+# Local automation tools and browser state
+.local-tools/
+
 # Virtual Environment
 .venv/
 venv/
