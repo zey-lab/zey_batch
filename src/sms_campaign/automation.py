@@ -142,11 +142,18 @@ class SupportsCampaignRun(Protocol):
     def run(self) -> dict[str, Any]: ...
 
 
+class SupportsCustomerSync(Protocol):
+    """Minimal contract for synchronizing a validated export into customer storage."""
+
+    def sync_dataframe(self, customers: pd.DataFrame) -> Any: ...
+
+
 @dataclass(frozen=True)
 class ScheduledRunResult:
     """Sanitized result of one scheduled dry-run execution."""
 
     export: ExportValidationReport
+    customer_sync: Any | None
     campaign: dict[str, Any]
 
 
@@ -161,6 +168,8 @@ class ScheduledCampaignRunner:
         sync_opt_outs: Callable[[], None],
         campaign_manager: SupportsCampaignRun,
         lock_path: Path,
+        customer_store: SupportsCustomerSync | None = None,
+        customer_dataframe_loader: Callable[[Path], pd.DataFrame] = FileHandler.read_dataframe,
     ) -> None:
         self.config = config
         self.export_path = export_path
@@ -168,12 +177,23 @@ class ScheduledCampaignRunner:
         self.sync_opt_outs = sync_opt_outs
         self.campaign_manager = campaign_manager
         self.lock_path = lock_path
+        self.customer_store = customer_store
+        self.customer_dataframe_loader = customer_dataframe_loader
 
     def run(self) -> ScheduledRunResult:
         """Validate, sync consent, and execute a single dry-run campaign pass."""
         ensure_dry_run(self.config)
         with RunLock(self.lock_path):
             export_report = self.validator.validate(self.export_path)
+            customer_sync = None
+            if self.customer_store is not None:
+                customer_sync = self.customer_store.sync_dataframe(
+                    self.customer_dataframe_loader(self.export_path)
+                )
             self.sync_opt_outs()
             campaign_summary = self.campaign_manager.run()
-        return ScheduledRunResult(export=export_report, campaign=campaign_summary)
+        return ScheduledRunResult(
+            export=export_report,
+            customer_sync=customer_sync,
+            campaign=campaign_summary,
+        )

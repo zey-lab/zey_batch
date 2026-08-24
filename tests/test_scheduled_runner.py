@@ -4,6 +4,8 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+import pandas as pd
+
 from sms_campaign.automation import (
     AutomationSafetyError,
     ExportValidationError,
@@ -38,6 +40,17 @@ class _CampaignManager:
     def run(self) -> dict:
         self.events.append("campaign")
         return {"success": True, "total_sent": 2, "total_failed": 0}
+
+
+class _CustomerStore:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+        self.rows: list[dict] = []
+
+    def sync_dataframe(self, dataframe: pd.DataFrame) -> dict:
+        self.events.append("customer_db")
+        self.rows = dataframe.to_dict("records")
+        return {"inserted": len(dataframe), "updated": 0, "deactivated": 0, "invalid": 0}
 
 
 class TestScheduledCampaignRunner(unittest.TestCase):
@@ -111,6 +124,29 @@ class TestScheduledCampaignRunner(unittest.TestCase):
         self.assertEqual(events, ["validate", "sync", "campaign"])
         self.assertEqual(result.export.row_count, 2)
         self.assertEqual(result.campaign["total_sent"], 2)
+
+    def test_validated_export_is_synced_to_the_local_customer_master_before_campaigns(self) -> None:
+        events: list[str] = []
+        store = _CustomerStore(events)
+        with TemporaryDirectory() as temp_dir:
+            runner = ScheduledCampaignRunner(
+                config=_Config(dry_run=True),
+                export_path=Path("ignored.xlsx"),
+                validator=_Validator(events),
+                sync_opt_outs=lambda: events.append("sync"),
+                campaign_manager=_CampaignManager(events),
+                lock_path=Path(temp_dir) / "campaign.lock",
+                customer_store=store,
+                customer_dataframe_loader=lambda _: pd.DataFrame(
+                    [{"Mobile": "5550000001", "First Name": "Ana"}]
+                ),
+            )
+
+            result = runner.run()
+
+        self.assertEqual(events, ["validate", "customer_db", "sync", "campaign"])
+        self.assertEqual(store.rows[0]["First Name"], "Ana")
+        self.assertEqual(result.customer_sync["inserted"], 1)
 
     def test_existing_lock_prevents_an_overlapping_run(self) -> None:
         events: list[str] = []
