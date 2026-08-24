@@ -52,9 +52,12 @@ if [[ ! -S "/tmp/.X11-unix/X${DISPLAY_NUM#:}" ]]; then
   exit 1
 fi
 
+# The VNC port is reachable only on Docker's private bridge network. It is not
+# published as a host port; access from the Mac is exclusively through an SSH tunnel.
+# A VNC password is still required as defense in depth.
 start_if_not_running "$RUNTIME/vnc.pid" \
   env LD_LIBRARY_PATH="$X11VNC_LIBS" "$X11VNC" \
-    -display "$DISPLAY_NUM" -localhost -forever -shared -rfbport "$VNC_PORT" \
+    -display "$DISPLAY_NUM" -forever -shared -rfbport "$VNC_PORT" \
     -passwdfile "$RUNTIME/vnc_password" -o "$RUNTIME/x11vnc.log"
 
 if [[ ! -f "$RUNTIME/chromium.pid" ]] || ! kill -0 "$(<"$RUNTIME/chromium.pid")" 2>/dev/null; then
