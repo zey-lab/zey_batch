@@ -122,6 +122,22 @@ class TestCustomerStore(unittest.TestCase):
             ],
         )
 
+    def test_source_rows_with_array_fields_are_stored_without_breaking_sync(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            store = CustomerStore(Path(temp_dir) / "customers.sqlite3")
+            result = store.sync_dataframe(
+                pd.DataFrame(
+                    [{
+                        "Mobile": "5550000001",
+                        "First Name": "Ana",
+                        "ServiceProviders": ["Zey"],
+                        "CustomFieldsGroups": [],
+                    }]
+                )
+            )
+
+        self.assertEqual(result.inserted, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

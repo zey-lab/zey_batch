@@ -77,9 +77,14 @@ class CustomerStore:
             )
 
     @staticmethod
-    def _value(row: pd.Series, column: str) -> str | None:
+    def _value(row: pd.Series, column: str) -> Any:
         value = row.get(column)
-        if value is None or pd.isna(value):
+        if value is None:
+            return None
+        if isinstance(value, (list, tuple, dict)):
+            return value
+        missing = pd.isna(value)
+        if getattr(missing, "ndim", 0) == 0 and bool(missing):
             return None
         if isinstance(value, (datetime, pd.Timestamp)):
             return value.isoformat()
