@@ -27,6 +27,21 @@ class CustomerSyncResult:
 class CustomerStore:
     """Persist Vagaro customer data while retaining application-owned SMS state."""
 
+    EXPORT_COLUMNS = (
+        "Mobile",
+        "First Name",
+        "Last Name",
+        "Last Visited",
+        "Birthdate",
+        "Customer Since",
+        "last_sms_sent_date",
+        "last_sms_status",
+        "SMS_Opt_Out",
+        "Opt_Out_Date",
+        "last_review_sent_date",
+        "active_in_latest_export",
+    )
+
     def __init__(self, database_path: Path) -> None:
         self.database_path = database_path
         self._initialize()
@@ -207,3 +222,28 @@ class CustomerStore:
         customer = dict(row)
         customer["active_in_latest_export"] = bool(customer["active_in_latest_export"])
         return customer
+
+    def export_dataframe(self, active_only: bool = False) -> pd.DataFrame:
+        """Export campaign-compatible customer data without internal raw source payloads."""
+        query = """
+            SELECT
+                phone AS 'Mobile',
+                first_name AS 'First Name',
+                last_name AS 'Last Name',
+                last_visited AS 'Last Visited',
+                birthdate AS 'Birthdate',
+                customer_since AS 'Customer Since',
+                last_sms_sent_date,
+                last_sms_status,
+                sms_opt_out AS 'SMS_Opt_Out',
+                opt_out_date AS 'Opt_Out_Date',
+                last_review_sent_date,
+                active_in_latest_export
+            FROM customers
+        """
+        if active_only:
+            query += " WHERE active_in_latest_export = 1"
+        query += " ORDER BY phone"
+        with self._connect() as connection:
+            rows = connection.execute(query).fetchall()
+        return pd.DataFrame([dict(row) for row in rows], columns=self.EXPORT_COLUMNS)

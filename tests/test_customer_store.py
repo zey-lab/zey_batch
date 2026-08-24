@@ -92,6 +92,36 @@ class TestCustomerStore(unittest.TestCase):
         self.assertEqual(result.inserted, 0)
         self.assertEqual(result.invalid, 1)
 
+    def test_export_dataframe_produces_campaign_compatible_columns_without_raw_source_payload(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            store = CustomerStore(Path(temp_dir) / "customers.sqlite3")
+            store.sync_dataframe(
+                pd.DataFrame(
+                    [{"Mobile": "5550000001", "First Name": "Ana", "Last Visited": "2026-08-01"}]
+                )
+            )
+
+            export = store.export_dataframe()
+
+        self.assertEqual(export.loc[0, "Mobile"], "+15550000001")
+        self.assertEqual(export.loc[0, "First Name"], "Ana")
+        self.assertEqual(export.loc[0, "Last Visited"], "2026-08-01")
+        self.assertNotIn("source_data", export.columns)
+
+    def test_empty_customer_master_export_still_has_the_expected_schema(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            store = CustomerStore(Path(temp_dir) / "customers.sqlite3")
+            export = store.export_dataframe()
+
+        self.assertEqual(
+            list(export.columns),
+            [
+                "Mobile", "First Name", "Last Name", "Last Visited", "Birthdate",
+                "Customer Since", "last_sms_sent_date", "last_sms_status", "SMS_Opt_Out",
+                "Opt_Out_Date", "last_review_sent_date", "active_in_latest_export",
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
