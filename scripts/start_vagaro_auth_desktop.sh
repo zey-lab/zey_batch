@@ -63,9 +63,10 @@ start_if_not_running "$RUNTIME/vnc.pid" \
 if [[ ! -f "$RUNTIME/chromium.pid" ]] || ! kill -0 "$(<"$RUNTIME/chromium.pid")" 2>/dev/null; then
   DISPLAY="$DISPLAY_NUM" "$CHROMIUM" \
     --no-sandbox --disable-dev-shm-usage --disable-gpu \
+    --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222 \
     --user-data-dir="$PROFILE" \
     --no-first-run --no-default-browser-check --disable-sync \
-    --window-size=1440,1000 "https://www.vagaro.com/login" \
+    --window-size=1440,1000 "https://us04.vagaro.com/merchants/calendar/v3" \
     >"$RUNTIME/chromium.log" 2>&1 &
   echo $! > "$RUNTIME/chromium.pid"
 fi
