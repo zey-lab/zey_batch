@@ -80,6 +80,20 @@ class ZeyDataStore:
                     "tags": self._str(row.get("Tags")),
                 }
 
+                # Check if this vagaro_user_id already exists (different mobile)
+                existing_by_vagaro = conn.execute(
+                    "SELECT customer_id, mobile FROM customers WHERE vagaro_user_id=? AND mobile!=?",
+                    (vagaro_id, mobile),
+                ).fetchone() if vagaro_id else None
+
+                if existing_by_vagaro:
+                    # Merge: keep the old mobile's record, update vagaro_id on the new one
+                    # Delete the duplicate vagaro_id entry
+                    conn.execute(
+                        "UPDATE customers SET vagaro_user_id=NULL WHERE customer_id=?",
+                        (existing_by_vagaro["customer_id"],),
+                    )
+
                 if mobile in existing:
                     # Preserve opt-out status, communication preference, and tracking
                     old = existing[mobile]

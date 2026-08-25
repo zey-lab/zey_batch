@@ -40,10 +40,7 @@ function parseJson(raw) {
   try { return JSON.parse(raw); } catch { return null; }
 }
 
-// Timezone gate: only run at 18:00-18:05 America/Chicago
-const now = new Date();
-const chicagoTime = new Date(now.toLocaleString('en-US', { timeZone: 'America/Chicago' }));
-if (chicagoTime.getHours() !== 18 || chicagoTime.getMinutes() > 5) process.exit(0);
+// No timezone gate — cron schedule handles timing (0 23,0 * * * UTC = 18:00 Central)
 
 const report = { startedAt: new Date().toISOString(), steps: {} };
 
