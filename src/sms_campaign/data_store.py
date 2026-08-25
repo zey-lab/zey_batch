@@ -44,6 +44,38 @@ class ZeyDataStore:
         if df.empty:
             return SyncResult()
 
+        source_count = len(df)
+        df = df.copy()
+        df["_normalized_phone"] = df.apply(
+            lambda r: self._normalize_phone(r.get("Mobile", r.get("CellPhone"))), axis=1
+        )
+        invalid_count = int(df["_normalized_phone"].isna().sum())
+
+        valid_df = df[df["_normalized_phone"].notna()].copy()
+        valid_df["_sort_date"] = valid_df.apply(
+            lambda r: self._str(r.get("LastVisited")) or self._str(r.get("CustomerSince")) or "",
+            axis=1,
+        )
+        valid_df = valid_df.sort_values("_sort_date", ascending=False)
+        deduped_df = valid_df.drop_duplicates(subset="_normalized_phone", keep="first")
+
+        duplicate_count = len(valid_df) - len(deduped_df)
+        unique_count = len(deduped_df)
+
+        if source_count != invalid_count + duplicate_count + unique_count:
+            raise ValueError(
+                f"Reconciliation mismatch: source={source_count} != "
+                f"invalid={invalid_count} + duplicate={duplicate_count} + unique={unique_count}"
+            )
+        print(
+            f"[sync_customers] reconciliation OK: source={source_count} "
+            f"= invalid={invalid_count} + duplicate={duplicate_count} + unique={unique_count}"
+        )
+        if duplicate_count:
+            print(f"[sync_customers] collapsed {duplicate_count} duplicate-phone rows")
+
+        df = deduped_df.drop(columns=["_normalized_phone", "_sort_date"])
+
         result = SyncResult()
         conn = self._conn()
         try:
@@ -64,20 +96,20 @@ class ZeyDataStore:
                     "mobile": mobile,
                     "first_name": self._str(row.get("FirstName")),
                     "last_name": self._str(row.get("LastName")),
-                    "email": self._str(row.get("Email")),
+                    "email": self._str(row.get("EmailAddress")),
                     "birthdate": self._str(row.get("BirthDate")),
                     "gender": self._str(row.get("Gender")),
-                    "address": self._str(row.get("Address")),
+                    "address": self._str(row.get("StreetAddress")),
                     "city": self._str(row.get("City")),
                     "state": self._str(row.get("State")),
                     "zip": self._str(row.get("Zip")),
-                    "apt_suite": self._str(row.get("Apt/Suite")),
+                    "apt_suite": self._str(row.get("StreetNo")),
                     "customer_since": self._str(row.get("CustomerSince")),
                     "last_visit": self._str(row.get("LastVisited")),
-                    "membership": self._str(row.get("Membership")),
+                    "membership": self._str(row.get("MembershipName")),
                     "referred_by": self._str(row.get("ReferredBy")),
                     "online_booking": self._str(row.get("OnlineBooking")),
-                    "tags": self._str(row.get("Tags")),
+                    "tags": self._str(row.get("GeneralTag")),
                 # Raw Vagaro fields
                 "acquisition": self._str(row.get("Acquisition")),
                 "bank_name_number": self._str(row.get("BankNameNumber")),
@@ -105,6 +137,7 @@ class ZeyDataStore:
                 "ucc_no": self._str(row.get("UccNo")),
                 "ucc_type": self._str(row.get("UccType")),
                 "enc_user_id": self._str(row.get("encUserId")),
+                "raw_json": json.dumps(row.to_dict(), default=str),
                 }
 
                 # Check if this vagaro_user_id already exists (different mobile)
@@ -141,7 +174,20 @@ class ZeyDataStore:
                             referred_by=:referred_by, online_booking=:online_booking,
                             tags=:tags, sms_opt_out=:sms_opt_out, opt_out_date=:opt_out_date,
                             email_opt_out=:email_opt_out, communication_preference=:communication_preference,
-                            active=:active, updated_at=:updated_at
+                            active=:active, updated_at=:updated_at,
+                            acquisition=:acquisition, bank_name_number=:bank_name_number,
+                            cdn_url=:cdn_url, country_id=:country_id,
+                            custom_fields_groups=:custom_fields_groups, day_phone=:day_phone,
+                            email_failed_reason=:email_failed_reason, email_format=:email_format,
+                            general_tag=:general_tag, is_valid_email=:is_valid_email,
+                            is_valid_text=:is_valid_text, night_phone=:night_phone,
+                            no_of_booking=:no_of_booking, no_of_class_booked=:no_of_class_booked,
+                            no_of_class_check_ins=:no_of_class_check_ins, no_show_cancel=:no_show_cancel,
+                            photo=:photo, service_providers=:service_providers,
+                            street_address=:street_address, street_no=:street_no,
+                            text_failed_reason=:text_failed_reason, total_amount_paid=:total_amount_paid,
+                            total_points_accumulated=:total_points_accumulated, ucc_no=:ucc_no,
+                            ucc_type=:ucc_type, enc_user_id=:enc_user_id, raw_json=:raw_json
                         WHERE mobile=:mobile""",
                         data,
                     )
@@ -153,12 +199,26 @@ class ZeyDataStore:
                             (vagaro_user_id, mobile, first_name, last_name, email,
                              birthdate, gender, address, city, state, zip, apt_suite,
                              customer_since, last_visit, membership, referred_by,
-                             online_booking, tags, active)
+                             online_booking, tags, active,
+                             acquisition, bank_name_number, cdn_url, country_id,
+                             custom_fields_groups, day_phone, email_failed_reason, email_format,
+                             general_tag, is_valid_email, is_valid_text, night_phone,
+                             no_of_booking, no_of_class_booked, no_of_class_check_ins, no_show_cancel,
+                             photo, service_providers, street_address, street_no,
+                             text_failed_reason, total_amount_paid, total_points_accumulated,
+                             ucc_no, ucc_type, enc_user_id, raw_json)
                         VALUES
                             (:vagaro_user_id, :mobile, :first_name, :last_name, :email,
                              :birthdate, :gender, :address, :city, :state, :zip, :apt_suite,
                              :customer_since, :last_visit, :membership, :referred_by,
-                             :online_booking, :tags, :active)""",
+                             :online_booking, :tags, :active,
+                             :acquisition, :bank_name_number, :cdn_url, :country_id,
+                             :custom_fields_groups, :day_phone, :email_failed_reason, :email_format,
+                             :general_tag, :is_valid_email, :is_valid_text, :night_phone,
+                             :no_of_booking, :no_of_class_booked, :no_of_class_check_ins, :no_show_cancel,
+                             :photo, :service_providers, :street_address, :street_no,
+                             :text_failed_reason, :total_amount_paid, :total_points_accumulated,
+                             :ucc_no, :ucc_type, :enc_user_id, :raw_json)""",
                         data,
                     )
                     result.inserted += 1

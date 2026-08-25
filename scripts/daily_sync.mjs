@@ -32,12 +32,19 @@ const SCRIPTS = {
 
 function run(cmd) {
   try { return execSync(cmd, { encoding: 'utf-8', timeout: 600_000, cwd: ROOT }); }
-  catch { return null; }
+  catch (e) { return JSON.stringify({ error: e.message }); }
 }
 
 function parseJson(raw) {
   if (!raw) return null;
   try { return JSON.parse(raw); } catch { return null; }
+}
+
+function halt(report, step) {
+  report.status = 'error';
+  report.failedStep = step;
+  process.stdout.write(JSON.stringify(report) + '\n');
+  process.exit(1);
 }
 
 // No timezone gate — cron schedule handles timing (0 23,0 * * * UTC = 18:00 Central)
@@ -57,24 +64,31 @@ if (!report.steps.session || report.steps.session.status !== 'ok' || !report.ste
 
 // Step 2a: Extract customers
 report.steps.extractCustomers = parseJson(run(`node ${SCRIPTS.extractCustomers}`));
+if (!report.steps.extractCustomers || report.steps.extractCustomers.error) halt(report, 'extractCustomers');
 
 // Step 2b: Extract services/appointments
 report.steps.extractAppointments = parseJson(run(`node ${SCRIPTS.extractAppointments}`));
+if (!report.steps.extractAppointments || report.steps.extractAppointments.error) halt(report, 'extractAppointments');
 
 // Step 2c: Extract employees
 report.steps.extractEmployees = parseJson(run(`node ${SCRIPTS.extractEmployees}`));
+if (!report.steps.extractEmployees || report.steps.extractEmployees.error) halt(report, 'extractEmployees');
 
 // Step 3a: Sync customers to SQLite
 report.steps.syncCustomers = parseJson(run(`uv run python ${SCRIPTS.syncCustomers}`));
+if (!report.steps.syncCustomers || report.steps.syncCustomers.error) halt(report, 'syncCustomers');
 
 // Step 3b: Sync services to SQLite
 report.steps.syncServices = parseJson(run(`uv run python ${SCRIPTS.syncServices}`));
+if (!report.steps.syncServices || report.steps.syncServices.error) halt(report, 'syncServices');
 
 // Step 3c: Sync employees to SQLite
 report.steps.syncEmployees = parseJson(run(`uv run python ${SCRIPTS.syncEmployees}`));
+if (!report.steps.syncEmployees || report.steps.syncEmployees.error) halt(report, 'syncEmployees');
 
-// Step 4: Mirror all tables to Google Sheets
+// Step 4: Mirror all tables to Google Sheets — gated on successful sync above
 report.steps.mirror = parseJson(run(`uv run python ${SCRIPTS.mirror}`));
+if (!report.steps.mirror || report.steps.mirror.error) halt(report, 'mirror');
 
 // Step 5: Backup SQLite to Google Drive
 report.steps.backup = parseJson(run(`uv run python ${SCRIPTS.backup}`));

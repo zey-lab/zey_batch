@@ -58,6 +58,7 @@ CREATE TABLE IF NOT EXISTS customers (
     ucc_no TEXT,
     ucc_type TEXT,
     enc_user_id TEXT,
+    raw_json        TEXT,
     created_at      TEXT DEFAULT (datetime('now')),
     updated_at      TEXT DEFAULT (datetime('now'))
 );
@@ -86,32 +87,6 @@ CREATE TABLE IF NOT EXISTS employees (
     email           TEXT,
     active          INTEGER DEFAULT 1,
     schedule_json   TEXT,  -- weekly schedule as JSON
-    acquisition TEXT,
-    bank_name_number TEXT,
-    cdn_url TEXT,
-    country_id TEXT,
-    custom_fields_groups TEXT,
-    day_phone TEXT,
-    email_failed_reason TEXT,
-    email_format TEXT,
-    general_tag TEXT,
-    is_valid_email INTEGER,
-    is_valid_text INTEGER,
-    night_phone TEXT,
-    no_of_booking INTEGER,
-    no_of_class_booked INTEGER,
-    no_of_class_check_ins INTEGER,
-    no_show_cancel INTEGER,
-    photo TEXT,
-    service_providers TEXT,
-    street_address TEXT,
-    street_no TEXT,
-    text_failed_reason TEXT,
-    total_amount_paid REAL,
-    total_points_accumulated REAL,
-    ucc_no TEXT,
-    ucc_type TEXT,
-    enc_user_id TEXT,
     created_at      TEXT DEFAULT (datetime('now')),
     updated_at      TEXT DEFAULT (datetime('now'))
 );
@@ -155,32 +130,6 @@ CREATE TABLE IF NOT EXISTS campaigns (
     process_date    TEXT,
     process_status  TEXT,
     active          INTEGER DEFAULT 1,
-    acquisition TEXT,
-    bank_name_number TEXT,
-    cdn_url TEXT,
-    country_id TEXT,
-    custom_fields_groups TEXT,
-    day_phone TEXT,
-    email_failed_reason TEXT,
-    email_format TEXT,
-    general_tag TEXT,
-    is_valid_email INTEGER,
-    is_valid_text INTEGER,
-    night_phone TEXT,
-    no_of_booking INTEGER,
-    no_of_class_booked INTEGER,
-    no_of_class_check_ins INTEGER,
-    no_show_cancel INTEGER,
-    photo TEXT,
-    service_providers TEXT,
-    street_address TEXT,
-    street_no TEXT,
-    text_failed_reason TEXT,
-    total_amount_paid REAL,
-    total_points_accumulated REAL,
-    ucc_no TEXT,
-    ucc_type TEXT,
-    enc_user_id TEXT,
     created_at      TEXT DEFAULT (datetime('now')),
     updated_at      TEXT DEFAULT (datetime('now'))
 );
@@ -209,6 +158,41 @@ CREATE INDEX IF NOT EXISTS idx_employees_vagaro ON employees(vagaro_emp_id);
 """
 
 
+def _parse_columns(table: str) -> list[tuple[str, str]]:
+    """Extract (column_name, column_type) pairs for a table from SCHEMA_SQL."""
+    marker = f"CREATE TABLE IF NOT EXISTS {table} ("
+    start = SCHEMA_SQL.index(marker) + len(marker)
+    end = SCHEMA_SQL.index(");", start)
+    body = SCHEMA_SQL[start:end]
+    columns = []
+    for line in body.splitlines():
+        line = line.strip().rstrip(",")
+        if not line or line.startswith("--"):
+            continue
+        if line.upper().startswith(("PRIMARY KEY", "FOREIGN KEY", "UNIQUE(", "CHECK(")):
+            continue
+        parts = line.split()
+        name, col_type = parts[0], (parts[1] if len(parts) > 1 else "TEXT")
+        columns.append((name, col_type))
+    return columns
+
+
+def migrate_database(db_path: Path) -> None:
+    """Idempotently add any columns present in SCHEMA_SQL but missing from an existing DB."""
+    conn = sqlite3.connect(str(db_path))
+    try:
+        for table in ("customers", "services", "employees", "campaigns"):
+            existing = {
+                row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            for name, col_type in _parse_columns(table):
+                if name not in existing:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {col_type}")
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def init_database(db_path: Path) -> None:
     """Create or migrate the SQLite database schema."""
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -218,3 +202,4 @@ def init_database(db_path: Path) -> None:
         conn.commit()
     finally:
         conn.close()
+    migrate_database(db_path)
