@@ -362,7 +362,7 @@ class ZeyDataStore:
                     "name": self._str(row.get("Name", row.get("EmployeeName"))),
                     "role": self._str(row.get("Role", row.get("Title"))),
                     "phone": self._str(row.get("Phone")),
-                    "email": self._str(row.get("Email")),
+                    "email": self._str(row.get("EmailAddress")),
                     "active": 1,
                 }
 
