@@ -11,7 +11,7 @@ from sms_campaign.data_store import ZeyDataStore
 
 ROOT = Path(__file__).resolve().parents[2]
 DATABASE_PATH = ROOT / "data" / "customer_master.sqlite3"
-SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "1idBA_ifhKrRH7Pij0ZRtLFWXch7ZRlft9XS8ZP6jFF4")
+SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "1M8sIzteYlgKHiG44pEYIr60WwytfV5-MMc-P-6HasZQ")
 GWS_PATH = os.getenv("GWS_PATH", "/opt/data/.local/bin/gws")
 GWS_HOME = os.getenv("GWS_HOME", "/opt/data")
 

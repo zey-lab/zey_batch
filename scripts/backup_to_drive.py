@@ -11,7 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 DB_PATH = ROOT / "data" / "customer_master.sqlite3"
 ARCHIVE_DIR = ROOT / "data" / "archive"
-DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "1eF2LPhjOjGKHJUlgZ4DjYH1UlR4--91K")
+DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "1JnKDEnTC2C_uiQueqLbX92lx1SRGkje6")
 GWS_PATH = os.getenv("GWS_PATH", "/opt/data/.local/bin/gws")
 GWS_HOME = os.getenv("GWS_HOME", "/opt/data")
 INCOMING_DIR = ROOT / "data" / "incoming"
