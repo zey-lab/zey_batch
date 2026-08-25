@@ -20,6 +20,7 @@ TABLE_SHEETS = {
     "customers": "Customers",
     "sms_history": "SMS History",
     "services": "Services",
+    "transactions": "Transactions",
     "employees": "Employees",
     "campaigns": "Campaigns",
     "sync_log": "Sync Log",

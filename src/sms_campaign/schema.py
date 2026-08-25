@@ -77,6 +77,27 @@ CREATE TABLE IF NOT EXISTS services (
     created_at      TEXT DEFAULT (datetime('now'))
 );
 
+-- Transactions: sales/payment history from Vagaro Reports > Sales > Transaction List
+CREATE TABLE IF NOT EXISTS transactions (
+    transaction_id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    vagaro_transaction_id   TEXT UNIQUE,
+    customer_id             INTEGER REFERENCES customers(customer_id),
+    customer_name           TEXT,
+    employee_name           TEXT,
+    transaction_date        TEXT,
+    transaction_type        TEXT,  -- Sale, Refund, etc.
+    payment_method          TEXT,
+    subtotal                REAL,
+    tax                     REAL,
+    tip                     REAL,
+    discount                REAL,
+    total_amount            REAL,
+    status                  TEXT,
+    notes                   TEXT,
+    raw_json                TEXT,
+    created_at              TEXT DEFAULT (datetime('now'))
+);
+
 -- Employees: staff roster from Vagaro
 CREATE TABLE IF NOT EXISTS employees (
     employee_id     INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -152,6 +173,8 @@ CREATE INDEX IF NOT EXISTS idx_customers_mobile ON customers(mobile);
 CREATE INDEX IF NOT EXISTS idx_customers_vagaro ON customers(vagaro_user_id);
 CREATE INDEX IF NOT EXISTS idx_services_customer ON services(customer_id);
 CREATE INDEX IF NOT EXISTS idx_services_date ON services(service_date);
+CREATE INDEX IF NOT EXISTS idx_transactions_customer ON transactions(customer_id);
+CREATE INDEX IF NOT EXISTS idx_transactions_date ON transactions(transaction_date);
 CREATE INDEX IF NOT EXISTS idx_sms_history_customer ON sms_history(customer_id);
 CREATE INDEX IF NOT EXISTS idx_sms_history_sent ON sms_history(sent_at);
 CREATE INDEX IF NOT EXISTS idx_employees_vagaro ON employees(vagaro_emp_id);
@@ -181,7 +204,7 @@ def migrate_database(db_path: Path) -> None:
     """Idempotently add any columns present in SCHEMA_SQL but missing from an existing DB."""
     conn = sqlite3.connect(str(db_path))
     try:
-        for table in ("customers", "services", "employees", "campaigns"):
+        for table in ("customers", "services", "employees", "campaigns", "transactions"):
             existing = {
                 row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
             }

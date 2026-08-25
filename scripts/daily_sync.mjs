@@ -5,7 +5,7 @@
  *
  * Pipeline:
  * 1. Check Vagaro session health
- * 2. Extract customers, services, employees from Vagaro
+ * 2. Extract customers, services, employees, transactions from Vagaro
  * 3. Sync all data into SQLite
  * 4. Mirror all tables to Google Sheets
  * 5. Backup SQLite to Google Drive
@@ -23,9 +23,11 @@ const SCRIPTS = {
   extractCustomers: `${ROOT}/scripts/extract_vagaro_customers.mjs`,
   extractAppointments: `${ROOT}/scripts/extract_vagaro_appointments.mjs`,
   extractEmployees: `${ROOT}/scripts/extract_vagaro_employees.mjs`,
+  extractTransactions: `${ROOT}/scripts/extract_vagaro_transactions.mjs`,
   syncCustomers: `${ROOT}/scripts/sync_to_database.py`,
   syncServices: `${ROOT}/scripts/sync_services.py`,
   syncEmployees: `${ROOT}/scripts/sync_employees.py`,
+  syncTransactions: `${ROOT}/scripts/sync_transactions.py`,
   mirror: `${ROOT}/scripts/mirror_to_sheets.py`,
   backup: `${ROOT}/scripts/backup_to_drive.py`,
 };
@@ -74,6 +76,10 @@ if (!report.steps.extractAppointments || report.steps.extractAppointments.error)
 report.steps.extractEmployees = parseJson(run(`node ${SCRIPTS.extractEmployees}`));
 if (!report.steps.extractEmployees || report.steps.extractEmployees.error) halt(report, 'extractEmployees');
 
+// Step 2d: Extract transactions
+report.steps.extractTransactions = parseJson(run(`node ${SCRIPTS.extractTransactions}`));
+if (!report.steps.extractTransactions || report.steps.extractTransactions.error) halt(report, 'extractTransactions');
+
 // Step 3a: Sync customers to SQLite
 report.steps.syncCustomers = parseJson(run(`uv run python ${SCRIPTS.syncCustomers}`));
 if (!report.steps.syncCustomers || report.steps.syncCustomers.error) halt(report, 'syncCustomers');
@@ -85,6 +91,10 @@ if (!report.steps.syncServices || report.steps.syncServices.error) halt(report, 
 // Step 3c: Sync employees to SQLite
 report.steps.syncEmployees = parseJson(run(`uv run python ${SCRIPTS.syncEmployees}`));
 if (!report.steps.syncEmployees || report.steps.syncEmployees.error) halt(report, 'syncEmployees');
+
+// Step 3d: Sync transactions to SQLite
+report.steps.syncTransactions = parseJson(run(`uv run python ${SCRIPTS.syncTransactions}`));
+if (!report.steps.syncTransactions || report.steps.syncTransactions.error) halt(report, 'syncTransactions');
 
 // Step 4: Mirror all tables to Google Sheets — gated on successful sync above
 report.steps.mirror = parseJson(run(`uv run python ${SCRIPTS.mirror}`));
