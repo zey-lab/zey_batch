@@ -1,14 +1,16 @@
 #!/usr/bin/env node
 /**
- * Daily Zey Brow customer data sync orchestrator.
+ * Daily Zey Brow full data sync orchestrator.
  * Runs as a script-only Hermes cron job (no LLM tokens).
  *
  * Pipeline:
  * 1. Check Vagaro session health
- * 2. Extract customers from Vagaro
- * 3. Sync into SQLite (customers + services + employees)
+ * 2. Extract customers, services, employees from Vagaro
+ * 3. Sync all data into SQLite
  * 4. Mirror all tables to Google Sheets
- * 5. Report results to stdout (delivered to Discord)
+ * 5. Backup SQLite to Google Drive
+ * 6. Clean local incoming files
+ * 7. Report results to stdout
  */
 
 import { execSync } from 'node:child_process';
@@ -16,14 +18,26 @@ import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
 const ROOT = '/opt/data/zey_batch';
-const EXTRACT = `${ROOT}/scripts/extract_vagaro_customers.mjs`;
-const SESSION_CHECK = `${ROOT}/scripts/check_vagaro_session.mjs`;
-const SYNC_PY = `${ROOT}/scripts/sync_to_database.py`;
-const MIRROR_PY = `${ROOT}/scripts/mirror_to_sheets.py`;
+const SCRIPTS = {
+  sessionCheck: `${ROOT}/scripts/check_vagaro_session.mjs`,
+  extractCustomers: `${ROOT}/scripts/extract_vagaro_customers.mjs`,
+  extractAppointments: `${ROOT}/scripts/extract_vagaro_appointments.mjs`,
+  extractEmployees: `${ROOT}/scripts/extract_vagaro_employees.mjs`,
+  syncCustomers: `${ROOT}/scripts/sync_to_database.py`,
+  syncServices: `${ROOT}/scripts/sync_services.py`,
+  syncEmployees: `${ROOT}/scripts/sync_employees.py`,
+  mirror: `${ROOT}/scripts/mirror_to_sheets.py`,
+  backup: `${ROOT}/scripts/backup_to_drive.py`,
+};
 
 function run(cmd) {
   try { return execSync(cmd, { encoding: 'utf-8', timeout: 600_000, cwd: ROOT }); }
   catch { return null; }
+}
+
+function parseJson(raw) {
+  if (!raw) return null;
+  try { return JSON.parse(raw); } catch { return null; }
 }
 
 // Timezone gate: only run at 18:00-18:05 America/Chicago
@@ -34,28 +48,48 @@ if (chicagoTime.getHours() !== 18 || chicagoTime.getMinutes() > 5) process.exit(
 const report = { startedAt: new Date().toISOString(), steps: {} };
 
 // Step 1: Session health
-const sessionCheck = run(`node ${SESSION_CHECK}`);
-if (!sessionCheck) { report.steps.session = { status: 'error' }; process.stdout.write(JSON.stringify(report) + '\n'); process.exit(1); }
-report.steps.session = JSON.parse(sessionCheck);
-if (report.steps.session.status !== 'ok' || !report.steps.session.authenticated) {
+const sessionRaw = run(`node ${SCRIPTS.sessionCheck}`);
+report.steps.session = parseJson(sessionRaw);
+if (!report.steps.session || report.steps.session.status !== 'ok' || !report.steps.session.authenticated) {
+  report.steps.session = report.steps.session || {};
   report.steps.session.message = 'Vagaro session expired. Re-login required.';
-  process.stdout.write(JSON.stringify(report) + '\n'); process.exit(1);
+  report.status = 'error';
+  process.stdout.write(JSON.stringify(report) + '\n');
+  process.exit(1);
 }
 
-// Step 2: Extract customers
-const exportResult = run(`node ${EXTRACT}`);
-if (!exportResult) { report.steps.extract = { status: 'error' }; process.stdout.write(JSON.stringify(report) + '\n'); process.exit(1); }
-report.steps.extract = JSON.parse(exportResult);
+// Step 2a: Extract customers
+report.steps.extractCustomers = parseJson(run(`node ${SCRIPTS.extractCustomers}`));
 
-// Step 3: Sync to SQLite
-const syncResult = run(`uv run python ${SYNC_PY}`);
-if (!syncResult) { report.steps.sync = { status: 'error' }; process.stdout.write(JSON.stringify(report) + '\n'); process.exit(1); }
-report.steps.sync = JSON.parse(syncResult);
+// Step 2b: Extract services/appointments
+report.steps.extractAppointments = parseJson(run(`node ${SCRIPTS.extractAppointments}`));
 
-// Step 4: Mirror to Google Sheets
-const mirrorResult = run(`uv run python ${MIRROR_PY}`);
-if (!mirrorResult) { report.steps.mirror = { status: 'error' }; process.stdout.write(JSON.stringify(report) + '\n'); process.exit(1); }
-report.steps.mirror = JSON.parse(mirrorResult);
+// Step 2c: Extract employees
+report.steps.extractEmployees = parseJson(run(`node ${SCRIPTS.extractEmployees}`));
+
+// Step 3a: Sync customers to SQLite
+report.steps.syncCustomers = parseJson(run(`uv run python ${SCRIPTS.syncCustomers}`));
+
+// Step 3b: Sync services to SQLite
+report.steps.syncServices = parseJson(run(`uv run python ${SCRIPTS.syncServices}`));
+
+// Step 3c: Sync employees to SQLite
+report.steps.syncEmployees = parseJson(run(`uv run python ${SCRIPTS.syncEmployees}`));
+
+// Step 4: Mirror all tables to Google Sheets
+report.steps.mirror = parseJson(run(`uv run python ${SCRIPTS.mirror}`));
+
+// Step 5: Backup SQLite to Google Drive
+report.steps.backup = parseJson(run(`uv run python ${SCRIPTS.backup}`));
+
+// Step 6: Get final stats
+report.steps.stats = parseJson(run(`uv run python -c "
+from sms_campaign.data_store import ZeyDataStore
+from pathlib import Path
+import json
+store = ZeyDataStore(Path('${ROOT}/data/customer_master.sqlite3'))
+print(json.dumps(store.get_stats()))
+"`));
 
 report.status = 'ok';
 report.completedAt = new Date().toISOString();
