@@ -107,8 +107,8 @@ def run_gws(*args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def widen_grid(sheet_gid: int, column_count: int = 60) -> None:
-    """Ensure a tab's grid has at least `column_count` columns."""
+def widen_grid(sheet_gid: int, column_count: int = 60, row_count: int = 3_000) -> None:
+    """Ensure a tab's grid has enough rows and columns for the mirror."""
     if os.getenv("GOOGLE_WORKSPACE_CLI_TOKEN"):
         sheets_api(
             ":batchUpdate",
@@ -117,9 +117,12 @@ def widen_grid(sheet_gid: int, column_count: int = 60) -> None:
                 "updateSheetProperties": {
                     "properties": {
                         "sheetId": sheet_gid,
-                        "gridProperties": {"columnCount": column_count},
+                        "gridProperties": {
+                            "columnCount": column_count,
+                            "rowCount": row_count,
+                        },
                     },
-                    "fields": "gridProperties.columnCount",
+                    "fields": "gridProperties.columnCount,gridProperties.rowCount",
                 },
             }]},
         )
@@ -132,9 +135,12 @@ def widen_grid(sheet_gid: int, column_count: int = 60) -> None:
                 "updateSheetProperties": {
                     "properties": {
                         "sheetId": sheet_gid,
-                        "gridProperties": {"columnCount": column_count},
+                        "gridProperties": {
+                            "columnCount": column_count,
+                            "rowCount": row_count,
+                        },
                     },
-                    "fields": "gridProperties.columnCount",
+                    "fields": "gridProperties.columnCount,gridProperties.rowCount",
                 },
             }],
         }),
@@ -183,7 +189,7 @@ def mirror_table(store: ZeyDataStore, table: str, sheet_name: str, sheet_gid: in
     last_col = _col_letter(max(n_cols, 78))  # BZ = 78
 
     if sheet_gid is not None:
-        widen_grid(sheet_gid, max(n_cols + 5, 60))
+        widen_grid(sheet_gid, max(n_cols + 5, 60), len(rows) + 5)
 
     # Clear existing data across the full width
     if os.getenv("GOOGLE_WORKSPACE_CLI_TOKEN"):
