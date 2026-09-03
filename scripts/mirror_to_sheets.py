@@ -188,3 +188,7 @@ def mirror_all(store: ZeyDataStore, dry_run: bool = False) -> dict:
         else:
             results[table] = mirror_table(store, table, sheet_name, sheet_ids.get(sheet_name))
     return {"status": "ok" if not dry_run else "dry-run", "sheets": results}
+
+
+if __name__ == "__main__":
+    print(json.dumps(mirror_all(ZeyDataStore(DATABASE_PATH))))
