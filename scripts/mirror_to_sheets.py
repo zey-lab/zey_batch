@@ -5,6 +5,9 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 from sms_campaign.data_store import ZeyDataStore
@@ -32,14 +35,14 @@ BATCH_ROWS = 200
 MAX_JSON_ARG_BYTES = 8_000
 
 
-def _value_batches(rows: list[list[str]]) -> list[list[list[str]]]:
+def _value_batches(rows: list[list[str]], max_json_bytes: int = MAX_JSON_ARG_BYTES) -> list[list[list[str]]]:
     """Split rows by both count and argv size for the gws JSON argument."""
     batches = []
     batch = []
     for row in rows:
         candidate = batch + [row]
         candidate_size = len(json.dumps({"values": candidate}).encode("utf-8"))
-        if batch and (len(candidate) > BATCH_ROWS or candidate_size > MAX_JSON_ARG_BYTES):
+        if batch and (len(candidate) > BATCH_ROWS or candidate_size > max_json_bytes):
             batches.append(batch)
             batch = [row]
         else:
@@ -47,6 +50,43 @@ def _value_batches(rows: list[list[str]]) -> list[list[list[str]]]:
     if batch:
         batches.append(batch)
     return batches
+
+
+def write_values(range_name: str, values: list[list[str]]) -> None:
+    """Write values without putting large JSON bodies in the gws argv."""
+    token = os.getenv("GOOGLE_WORKSPACE_CLI_TOKEN")
+    if not token:
+        run_gws(
+            "sheets", "spreadsheets", "values", "update",
+            "--params", json.dumps({
+                "spreadsheetId": SHEET_ID,
+                "range": range_name,
+                "valueInputOption": "RAW",
+            }),
+            "--json", json.dumps({"values": values}),
+        )
+        return
+
+    encoded_range = urllib.parse.quote(range_name, safe="!")
+    url = (
+        f"https://sheets.googleapis.com/v4/spreadsheets/{SHEET_ID}/values/"
+        f"{encoded_range}?valueInputOption=RAW"
+    )
+    request = urllib.request.Request(
+        url,
+        data=json.dumps({"values": values}).encode("utf-8"),
+        method="PUT",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request) as response:
+            response.read()
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode("utf-8", errors="replace")[:300]
+        raise RuntimeError(f"Google Sheets values update failed with HTTP {error.code}: {detail}") from error
 
 
 def run_gws(*args: str) -> subprocess.CompletedProcess[str]:
@@ -125,28 +165,13 @@ def mirror_table(store: ZeyDataStore, table: str, sheet_name: str, sheet_gid: in
 
     # Write header at a fixed range (not append — append skips rows with
     # stale trailing-column values, landing the header far below row 2)
-    run_gws(
-        "sheets", "spreadsheets", "values", "update",
-        "--params", json.dumps({
-            "spreadsheetId": SHEET_ID,
-            "range": f"{sheet_name}!A1",
-            "valueInputOption": "RAW",
-        }),
-        "--json", json.dumps({"values": [header]}),
-    )
+    write_values(f"{sheet_name}!A1", [header])
 
     # Write data in batches at fixed, sequential ranges
     start_row = 2
-    for batch in _value_batches(rows):
-        run_gws(
-            "sheets", "spreadsheets", "values", "update",
-            "--params", json.dumps({
-                "spreadsheetId": SHEET_ID,
-                "range": f"{sheet_name}!A{start_row}",
-                "valueInputOption": "RAW",
-            }),
-            "--json", json.dumps({"values": batch}),
-        )
+    max_json_bytes = 900_000 if os.getenv("GOOGLE_WORKSPACE_CLI_TOKEN") else MAX_JSON_ARG_BYTES
+    for batch in _value_batches(rows, max_json_bytes):
+        write_values(f"{sheet_name}!A{start_row}", batch)
         start_row += len(batch)
 
     return {"table": table, "sheet": sheet_name, "rows": len(rows)}
