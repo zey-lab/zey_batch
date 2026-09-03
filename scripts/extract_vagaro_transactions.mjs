@@ -3,12 +3,7 @@
  * Extract Vagaro Transaction List report via authenticated Chromium daemon.
  * Navigates to Reports > Sales > Transaction List and intercepts the API response.
  *
- * REPORT_URL/REPORT_ENDPOINT are env-overridable: the Vagaro session was logged
- * out at authoring time so the exact URL/endpoint could not be confirmed live
- * against the network tab. They follow the same reports/<noun>/list ->
- * getcustomers/getappointments/getemployees convention as the other three
- * report extractors in this directory. Verify on first authenticated run and
- * override via env if Vagaro's actual path differs, no code change needed.
+ * REPORT_URL/REPORT_ENDPOINT are env-overridable for future Vagaro changes.
  */
 
 import fs from 'node:fs';
@@ -19,10 +14,10 @@ const require = createRequire(import.meta.url);
 const { chromium } = require(process.env.PLAYWRIGHT_MODULE || '/opt/data/browser-worker/node_modules/playwright');
 
 const CDP_URL = process.env.VAGARO_CDP_URL || 'http://127.0.0.1:9222';
-const REPORT_URL = process.env.VAGARO_TRANSACTIONS_REPORT_URL || 'https://us04.vagaro.com/merchants/reports/transactions/list';
+const REPORT_URL = process.env.VAGARO_TRANSACTIONS_REPORT_URL || 'https://us04.vagaro.com/merchants/reports/sales/transactionlist';
 const OUTPUT_DIR = process.env.VAGARO_EXPORT_DIR || path.resolve('data/incoming');
 const OUTPUT_PATH = path.join(OUTPUT_DIR, 'vagaro_transactions_latest.json');
-const REPORT_ENDPOINT = process.env.VAGARO_TRANSACTIONS_REPORT_ENDPOINT || '/merchants/reports/gettransactions';
+const REPORT_ENDPOINT = process.env.VAGARO_TRANSACTIONS_REPORT_ENDPOINT || '/merchants/reports/sales/gettransactionlist';
 
 function nextReportResponse(cdp) {
   return new Promise((resolve, reject) => {
@@ -51,6 +46,15 @@ function nextReportResponse(cdp) {
   });
 }
 
+function reportRows(payload) {
+  const data = payload?.Data;
+  if (Array.isArray(data)) return { rows: data, total: data.length };
+  if (Array.isArray(data?.TransactionList)) {
+    return { rows: data.TransactionList, total: Number(data.TotalItems ?? data.TransactionList.length) };
+  }
+  throw new Error('Invalid transactions report response.');
+}
+
 async function main() {
   fs.mkdirSync(OUTPUT_DIR, { recursive: true, mode: 0o700 });
   const browser = await chromium.connectOverCDP(CDP_URL);
@@ -62,31 +66,21 @@ async function main() {
   await cdp.send('Network.setBypassServiceWorker', { bypass: true });
 
   try {
-    await page.goto(REPORT_URL, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+    const firstResponse = nextReportResponse(cdp);
+    await page.goto(REPORT_URL, { waitUntil: 'commit', timeout: 60_000 });
     await page.locator('.pagination-controls select').waitFor({ state: 'attached', timeout: 15_000 }).catch(() => null);
 
-    const selectExists = await page.locator('.pagination-controls select').count() > 0;
-    let firstPage;
-    if (selectExists) {
-      const responsePromise = nextReportResponse(cdp);
-      await page.locator('.pagination-controls select').selectOption('200', { force: true }).catch(() => null);
-      firstPage = await responsePromise;
-    } else {
-      firstPage = await nextReportResponse(cdp);
-    }
-
-    if (!Array.isArray(firstPage.Data)) throw new Error('Invalid transactions report response.');
-
-    const totalRecords = Number(firstPage.Data[0]?.TotalRecords ?? firstPage.Data.length);
-    const pageSize = 200;
-    const pageCount = Math.max(1, Math.ceil(totalRecords / pageSize));
-    const rows = [...firstPage.Data];
+    const firstPage = await firstResponse;
+    const first = reportRows(firstPage);
+    const pageSize = Number(await page.locator('.pagination-controls select').inputValue().catch(() => '50')) || 50;
+    const pageCount = Math.max(1, Math.ceil(first.total / pageSize));
+    const rows = [...first.rows];
 
     for (let pageNumber = 2; pageNumber <= pageCount; pageNumber++) {
       const responsePromise = nextReportResponse(cdp);
-      await page.locator('.pagination-controls-left button').filter({ has: page.locator('i.fa-angle-right') }).evaluate(b => b.click()).catch(() => null);
+      await page.locator('.pagination-controls-left button').filter({ has: page.locator('i.fa-angle-right') }).evaluate(b => b.click());
       const response = await responsePromise;
-      if (Array.isArray(response.Data)) rows.push(...response.Data);
+      rows.push(...reportRows(response).rows);
     }
 
     fs.writeFileSync(OUTPUT_PATH, JSON.stringify({
@@ -100,7 +94,8 @@ async function main() {
   } finally {
     await cdp.send('Network.setBypassServiceWorker', { bypass: false }).catch(() => {});
     await cdp.detach().catch(() => {});
-    await browser.close();
+    // This is a shared authenticated browser. Letting the process exit
+    // disconnects Playwright without destroying the session.
   }
 }
 

@@ -85,7 +85,9 @@ class ZeyDataStore:
             }
 
             for _, row in df.iterrows():
-                mobile = self._normalize_phone(row.get("Mobile", row.get("CellPhone")))
+                mobile = self._normalize_phone(
+                    row.get("Mobile", row.get("CellPhone", row.get("CustomerCell")))
+                )
                 if not mobile:
                     result.errors = (result.errors or []) + [f"Invalid phone: {row.get('Mobile')}"]
                     continue
@@ -365,8 +367,10 @@ class ZeyDataStore:
                     if cust:
                         customer_id = cust["customer_id"]
 
+                # ID identifies each line item in Vagaro's report. TransactionID
+                # identifies the checkout and repeats when it has multiple items.
                 vagaro_transaction_id = str(
-                    row.get("TransactionID", row.get("TransactionId", row.get("ID", "")))
+                    row.get("ID", row.get("TransactionID", row.get("TransactionId", "")))
                 )
                 if not vagaro_transaction_id:
                     result.errors = (result.errors or []) + ["Missing transaction ID"]
@@ -376,16 +380,18 @@ class ZeyDataStore:
                     "vagaro_transaction_id": vagaro_transaction_id,
                     "customer_id": customer_id,
                     "customer_name": self._str(row.get("CustomerName", row.get("Customer"))),
-                    "employee_name": self._str(row.get("Employee", row.get("Staff"))),
+                    "employee_name": self._str(
+                        row.get("Employee", row.get("Staff", row.get("ServiceProviderName", row.get("CheckedOutBy"))))
+                    ),
                     "transaction_date": self._str(row.get("TransactionDate", row.get("Date"))),
-                    "transaction_type": self._str(row.get("TransactionType", row.get("Type"))),
-                    "payment_method": self._str(row.get("PaymentMethod", row.get("PaymentType"))),
-                    "subtotal": self._float(row.get("SubTotal", row.get("Subtotal"))),
+                    "transaction_type": self._str(row.get("TransactionType", row.get("Type", row.get("TranType")))),
+                    "payment_method": self._str(row.get("PaymentMethod", row.get("PaymentType", row.get("CCType")))),
+                    "subtotal": self._float(row.get("SubTotal", row.get("Subtotal", row.get("Price")))),
                     "tax": self._float(row.get("Tax", row.get("TaxAmount"))),
                     "tip": self._float(row.get("Tip", row.get("TipAmount"))),
                     "discount": self._float(row.get("Discount", row.get("DiscountAmount"))),
                     "total_amount": self._float(
-                        row.get("Total", row.get("TotalAmount", row.get("GrandTotal")))
+                        row.get("Total", row.get("TotalAmount", row.get("GrandTotal", row.get("AmountPaid"))))
                     ),
                     "status": self._str(row.get("Status")),
                     "notes": self._str(row.get("Notes")),
