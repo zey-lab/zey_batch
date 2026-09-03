@@ -35,6 +35,28 @@ BATCH_ROWS = 200
 MAX_JSON_ARG_BYTES = 8_000
 
 
+def sheets_api(path: str, method: str = "GET", payload: dict | None = None) -> dict:
+    """Call the Sheets REST API with the short-lived OAuth access token."""
+    token = os.getenv("GOOGLE_WORKSPACE_CLI_TOKEN")
+    if not token:
+        raise RuntimeError("GOOGLE_WORKSPACE_CLI_TOKEN is required for direct Sheets API calls")
+    request = urllib.request.Request(
+        f"https://sheets.googleapis.com/v4/spreadsheets/{SHEET_ID}{path}",
+        data=json.dumps(payload).encode("utf-8") if payload is not None else None,
+        method=method,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode("utf-8", errors="replace")[:300]
+        raise RuntimeError(f"Google Sheets API request failed with HTTP {error.code}: {detail}") from error
+
+
 def _value_batches(rows: list[list[str]], max_json_bytes: int = MAX_JSON_ARG_BYTES) -> list[list[list[str]]]:
     """Split rows by both count and argv size for the gws JSON argument."""
     batches = []
@@ -68,25 +90,11 @@ def write_values(range_name: str, values: list[list[str]]) -> None:
         return
 
     encoded_range = urllib.parse.quote(range_name, safe="!")
-    url = (
-        f"https://sheets.googleapis.com/v4/spreadsheets/{SHEET_ID}/values/"
-        f"{encoded_range}?valueInputOption=RAW"
-    )
-    request = urllib.request.Request(
-        url,
-        data=json.dumps({"values": values}).encode("utf-8"),
+    sheets_api(
+        f"/values/{encoded_range}?valueInputOption=RAW",
         method="PUT",
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        },
+        payload={"values": values},
     )
-    try:
-        with urllib.request.urlopen(request) as response:
-            response.read()
-    except urllib.error.HTTPError as error:
-        detail = error.read().decode("utf-8", errors="replace")[:300]
-        raise RuntimeError(f"Google Sheets values update failed with HTTP {error.code}: {detail}") from error
 
 
 def run_gws(*args: str) -> subprocess.CompletedProcess[str]:
@@ -101,6 +109,21 @@ def run_gws(*args: str) -> subprocess.CompletedProcess[str]:
 
 def widen_grid(sheet_gid: int, column_count: int = 60) -> None:
     """Ensure a tab's grid has at least `column_count` columns."""
+    if os.getenv("GOOGLE_WORKSPACE_CLI_TOKEN"):
+        sheets_api(
+            ":batchUpdate",
+            method="POST",
+            payload={"requests": [{
+                "updateSheetProperties": {
+                    "properties": {
+                        "sheetId": sheet_gid,
+                        "gridProperties": {"columnCount": column_count},
+                    },
+                    "fields": "gridProperties.columnCount",
+                },
+            }]},
+        )
+        return
     run_gws(
         "sheets", "spreadsheets", "batchUpdate",
         "--params", json.dumps({"spreadsheetId": SHEET_ID}),
@@ -120,6 +143,12 @@ def widen_grid(sheet_gid: int, column_count: int = 60) -> None:
 
 def get_sheet_ids() -> dict[str, int]:
     """Map sheet tab name -> sheetId (gid) via spreadsheets.get."""
+    if os.getenv("GOOGLE_WORKSPACE_CLI_TOKEN"):
+        meta = sheets_api("")
+        return {
+            s["properties"]["title"]: s["properties"]["sheetId"]
+            for s in meta.get("sheets", [])
+        }
     proc = run_gws(
         "sheets", "spreadsheets", "get",
         "--params", json.dumps({"spreadsheetId": SHEET_ID}),
@@ -157,11 +186,18 @@ def mirror_table(store: ZeyDataStore, table: str, sheet_name: str, sheet_gid: in
         widen_grid(sheet_gid, max(n_cols + 5, 60))
 
     # Clear existing data across the full width
-    run_gws(
-        "sheets", "spreadsheets", "values", "batchClear",
-        "--params", json.dumps({"spreadsheetId": SHEET_ID}),
-        "--json", json.dumps({"ranges": [f"{sheet_name}!A2:{last_col}"]}),
-    )
+    if os.getenv("GOOGLE_WORKSPACE_CLI_TOKEN"):
+        sheets_api(
+            "/values:batchClear",
+            method="POST",
+            payload={"ranges": [f"{sheet_name}!A2:{last_col}"]},
+        )
+    else:
+        run_gws(
+            "sheets", "spreadsheets", "values", "batchClear",
+            "--params", json.dumps({"spreadsheetId": SHEET_ID}),
+            "--json", json.dumps({"ranges": [f"{sheet_name}!A2:{last_col}"]}),
+        )
 
     # Write header at a fixed range (not append — append skips rows with
     # stale trailing-column values, landing the header far below row 2)
