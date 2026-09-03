@@ -27,6 +27,24 @@ TABLE_SHEETS = {
 }
 
 BATCH_ROWS = 200
+MAX_JSON_ARG_BYTES = 100_000
+
+
+def _value_batches(rows: list[list[str]]) -> list[list[list[str]]]:
+    """Split rows by both count and argv size for the gws JSON argument."""
+    batches = []
+    batch = []
+    for row in rows:
+        candidate = batch + [row]
+        candidate_size = len(json.dumps({"values": candidate}).encode("utf-8"))
+        if batch and (len(candidate) > BATCH_ROWS or candidate_size > MAX_JSON_ARG_BYTES):
+            batches.append(batch)
+            batch = [row]
+        else:
+            batch = candidate
+    if batch:
+        batches.append(batch)
+    return batches
 
 
 def run_gws(*args: str) -> subprocess.CompletedProcess[str]:
@@ -116,9 +134,8 @@ def mirror_table(store: ZeyDataStore, table: str, sheet_name: str, sheet_gid: in
     )
 
     # Write data in batches at fixed, sequential ranges
-    for offset in range(0, len(rows), BATCH_ROWS):
-        batch = rows[offset:offset + BATCH_ROWS]
-        start_row = offset + 2  # row 1 is the header
+    start_row = 2
+    for batch in _value_batches(rows):
         run_gws(
             "sheets", "spreadsheets", "values", "update",
             "--params", json.dumps({
@@ -128,6 +145,7 @@ def mirror_table(store: ZeyDataStore, table: str, sheet_name: str, sheet_gid: in
             }),
             "--json", json.dumps({"values": batch}),
         )
+        start_row += len(batch)
 
     return {"table": table, "sheet": sheet_name, "rows": len(rows)}
 
