@@ -29,7 +29,7 @@ TABLE_SHEETS = {
 BATCH_ROWS = 200
 # Keep room for the process environment and gws arguments on small ARG_MAX
 # environments; transaction rows include a large raw_json column.
-MAX_JSON_ARG_BYTES = 32_000
+MAX_JSON_ARG_BYTES = 8_000
 
 
 def _value_batches(rows: list[list[str]]) -> list[list[list[str]]]:
