@@ -28,6 +28,7 @@ const SCRIPTS = {
   syncServices: `${ROOT}/scripts/sync_services.py`,
   syncEmployees: `${ROOT}/scripts/sync_employees.py`,
   syncTransactions: `${ROOT}/scripts/sync_transactions.py`,
+  syncCampaigns: `${ROOT}/scripts/sync_campaigns.py`,
   mirror: `${ROOT}/scripts/mirror_to_sheets.py`,
   backup: `${ROOT}/scripts/backup_to_drive.py`,
 };
@@ -95,6 +96,13 @@ if (!report.steps.syncEmployees || report.steps.syncEmployees.error) halt(report
 // Step 3d: Sync transactions to SQLite
 report.steps.syncTransactions = parseJson(run(`uv run python ${SCRIPTS.syncTransactions}`));
 if (!report.steps.syncTransactions || report.steps.syncTransactions.error) halt(report, 'syncTransactions');
+
+// Import the existing local campaign definitions before mirroring. A missing
+// source is reported as "skipped" so Vagaro data sync is not lost; once
+// campaigns.xlsx (or CAMPAIGN_CONFIG_PATH) is supplied, the next run imports
+// it idempotently and populates the Campaigns tab.
+report.steps.syncCampaigns = parseJson(run(`uv run python ${SCRIPTS.syncCampaigns}`));
+if (!report.steps.syncCampaigns || report.steps.syncCampaigns.error) halt(report, 'syncCampaigns');
 
 // Step 4: Mirror all tables to Google Sheets — gated on successful sync above
 report.steps.mirror = parseJson(run(`uv run python ${SCRIPTS.mirror}`));
