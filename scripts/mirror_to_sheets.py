@@ -229,12 +229,78 @@ def mirror_table(store: ZeyDataStore, table: str, sheet_name: str, sheet_gid: in
     return {"table": table, "sheet": sheet_name, "rows": len(rows)}
 
 
+def mirror_all_direct(store: ZeyDataStore, sheet_ids: dict[str, int]) -> dict:
+    """Mirror all tabs with three REST writes instead of one per batch.
+
+    The direct API path is used when a short-lived access token is available.
+    Sending one batchClear, one grid-properties batchUpdate, and one values
+    batchUpdate keeps a large historical transaction import below Sheets'
+    per-minute write-request quota.  The gws fallback retains its smaller
+    argv-safe batches in ``mirror_table``.
+    """
+    results: dict[str, dict] = {}
+    clear_ranges = []
+    grid_requests = []
+    value_data = []
+    transaction_data = []
+
+    for table, sheet_name in TABLE_SHEETS.items():
+        df = store.export_table(table).fillna("")
+        header = [str(c) for c in df.columns]
+        rows = [[str(v) for v in row] for row in df.itertuples(index=False, name=None)]
+        n_cols = max(len(header), 26)
+        last_col = _col_letter(max(n_cols, 78))
+        clear_ranges.append(f"{sheet_name}!A2:{last_col}")
+        if sheet_name in sheet_ids:
+            grid_requests.append({
+                "updateSheetProperties": {
+                    "properties": {
+                        "sheetId": sheet_ids[sheet_name],
+                        "gridProperties": {
+                            "columnCount": max(n_cols + 5, 60),
+                            "rowCount": len(rows) + 5,
+                        },
+                    },
+                    "fields": "gridProperties.columnCount,gridProperties.rowCount",
+                },
+            })
+
+        results[table] = {"table": table, "sheet": sheet_name, "rows": len(rows)}
+        if header:
+            value = {
+                "range": f"{sheet_name}!A1:{_col_letter(len(header))}{len(rows) + 1}",
+                "majorDimension": "ROWS",
+                "values": [header, *rows],
+            }
+            (transaction_data if table == "transactions" else value_data).append(value)
+
+    if clear_ranges:
+        sheets_api("/values:batchClear", method="POST", payload={"ranges": clear_ranges})
+    if grid_requests:
+        sheets_api(":batchUpdate", method="POST", payload={"requests": grid_requests})
+    if value_data:
+        sheets_api(
+            "/values:batchUpdate",
+            method="POST",
+            payload={"valueInputOption": "RAW", "data": value_data},
+        )
+    if transaction_data:
+        sheets_api(
+            "/values:batchUpdate",
+            method="POST",
+            payload={"valueInputOption": "RAW", "data": transaction_data},
+        )
+    return {"status": "ok", "sheets": results}
+
+
 def mirror_all(store: ZeyDataStore, dry_run: bool = False) -> dict:
     """Mirror all tables to Google Sheets. A failure on one table is logged
     and recorded per-table; it does not abort the remaining tables."""
     results = {}
     had_error = False
     sheet_ids = {} if dry_run else get_sheet_ids()
+    if not dry_run and os.getenv("GOOGLE_WORKSPACE_CLI_TOKEN"):
+        return mirror_all_direct(store, sheet_ids)
     for table, sheet_name in TABLE_SHEETS.items():
         if dry_run:
             df = store.export_table(table)
