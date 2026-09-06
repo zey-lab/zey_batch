@@ -22,10 +22,15 @@ class Handler(BaseHTTPRequestHandler):
     processor = WebhookProcessor(DB_PATH, os.getenv("VAGARO_WEBHOOK_TOKEN"))
 
     def do_GET(self) -> None:  # noqa: N802
-        if self.path == "/healthz":
-            self._send(200, {"status": "ok"})
-        else:
-            self._send(404, {"error": "not found"})
+        # Any GET is treated as a health probe (Cloudflare's tunnel health
+        # check hits the origin directly, not through the /vagaro/webhook
+        # path rule, so it must get a 2xx from any path it happens to hit).
+        self._send(200, {"status": "ok"})
+
+    def do_HEAD(self) -> None:  # noqa: N802
+        # Some webhook health-checkers probe with HEAD rather than GET;
+        # without this, http.server defaults to 501 Not Implemented.
+        self._send(200, {"status": "ok"})
 
     def do_POST(self) -> None:  # noqa: N802
         if self.path != WEBHOOK_PATH:
