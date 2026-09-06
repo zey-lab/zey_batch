@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import subprocess
 import sys
@@ -185,6 +186,13 @@ def _col_letter(n: int) -> str:
     return letters
 
 
+def _cell_text(value: object) -> str:
+    """Render integer-valued floats (nullable SQLite integers) without .0."""
+    if isinstance(value, float) and math.isfinite(value) and value.is_integer():
+        return str(int(value))
+    return str(value)
+
+
 def mirror_table(store: ZeyDataStore, table: str, sheet_name: str, sheet_gid: int | None = None) -> dict:
     """Mirror one SQLite table to one Google Sheet tab."""
     df = store.export_table(table)
@@ -194,7 +202,7 @@ def mirror_table(store: ZeyDataStore, table: str, sheet_name: str, sheet_gid: in
         return {"table": table, "sheet": sheet_name, "rows": 0}
 
     header = [str(c) for c in df.columns]
-    rows = [[str(v) for v in row] for row in df.itertuples(index=False, name=None)]
+    rows = [[_cell_text(v) for v in row] for row in df.itertuples(index=False, name=None)]
     n_cols = max(len(header), 26)
     last_col = _col_letter(max(n_cols, 78))  # BZ = 78
 
@@ -247,7 +255,7 @@ def mirror_all_direct(store: ZeyDataStore, sheet_ids: dict[str, int]) -> dict:
     for table, sheet_name in TABLE_SHEETS.items():
         df = store.export_table(table).fillna("")
         header = [str(c) for c in df.columns]
-        rows = [[str(v) for v in row] for row in df.itertuples(index=False, name=None)]
+        rows = [[_cell_text(v) for v in row] for row in df.itertuples(index=False, name=None)]
         n_cols = max(len(header), 26)
         last_col = _col_letter(max(n_cols, 78))
         clear_ranges.append(f"{sheet_name}!A2:{last_col}")
