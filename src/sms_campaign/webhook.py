@@ -85,6 +85,7 @@ class WebhookProcessor:
 
         supplied = ""
         for name in (
+            "X-Vagaro-Signature",
             "X-Vagaro-Verification-Token",
             "X-Verification-Token",
             "X-Webhook-Verification-Token",
