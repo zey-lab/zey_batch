@@ -168,6 +168,19 @@ CREATE TABLE IF NOT EXISTS sync_log (
     duration_sec    REAL
 );
 
+-- Webhook Events: durable receipt log for Vagaro retries and replay/audit
+CREATE TABLE IF NOT EXISTS webhook_events (
+    event_id         TEXT PRIMARY KEY,
+    event_type       TEXT NOT NULL,
+    action           TEXT,
+    event_created_at TEXT,
+    payload_json     TEXT NOT NULL,
+    received_at      TEXT DEFAULT (datetime('now')),
+    processed_at     TEXT,
+    process_status   TEXT NOT NULL DEFAULT 'received',
+    error_message    TEXT
+);
+
 -- Indexes for common queries
 CREATE INDEX IF NOT EXISTS idx_customers_mobile ON customers(mobile);
 CREATE INDEX IF NOT EXISTS idx_customers_vagaro ON customers(vagaro_user_id);

@@ -301,6 +301,17 @@ class ZeyDataStore:
                     ).fetchone()
                     if cust:
                         customer_id = cust["customer_id"]
+                if customer_id is None:
+                    vagaro_customer_id = self._str(
+                        row.get("CustomerID", row.get("CustomerId", row.get("UserID")))
+                    )
+                    if vagaro_customer_id:
+                        cust = conn.execute(
+                            "SELECT customer_id FROM customers WHERE vagaro_user_id=?",
+                            (vagaro_customer_id,),
+                        ).fetchone()
+                        if cust:
+                            customer_id = cust["customer_id"]
 
                 vagaro_appt_id = str(row.get("AppointmentID", row.get("ID", "")))
                 data = {
@@ -366,6 +377,17 @@ class ZeyDataStore:
                     ).fetchone()
                     if cust:
                         customer_id = cust["customer_id"]
+                if customer_id is None:
+                    vagaro_customer_id = self._str(
+                        row.get("CustomerID", row.get("CustomerId", row.get("UserID")))
+                    )
+                    if vagaro_customer_id:
+                        cust = conn.execute(
+                            "SELECT customer_id FROM customers WHERE vagaro_user_id=?",
+                            (vagaro_customer_id,),
+                        ).fetchone()
+                        if cust:
+                            customer_id = cust["customer_id"]
 
                 # ID identifies each line item in Vagaro's report. TransactionID
                 # identifies the checkout and repeats when it has multiple items.

@@ -79,6 +79,12 @@ To run tests or check for security leaks:
 uv run python test_setup.py
 ```
 
+### Vagaro webhook receiver
+
+The Cloudflare Tunnel should publish only `https://vagaro-webhook.zeybrow.com/vagaro/webhook` to the loopback receiver at `http://127.0.0.1:8787`. The receiver stores every accepted event in the SQLite `webhook_events` table and deduplicates Vagaro retries by event ID. Customer events remain in the receipt log until the daily full customer snapshot reconciles them.
+
+Set `VAGARO_WEBHOOK_TOKEN` in the server-only `.env` file after Vagaro creates the webhook and displays its verification token. Never commit or share that value. Install `deploy/vagaro-webhook.service` as a systemd service, then check `/healthz` locally before enabling the Vagaro webhook.
+
 ## Project Structure
 
 *   `src/sms_campaign/`: Source code for the application.
