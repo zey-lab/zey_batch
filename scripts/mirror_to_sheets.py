@@ -3,14 +3,23 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
+import sys
 import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
 
 from sms_campaign.data_store import ZeyDataStore
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s mirror_to_sheets: %(message)s",
+    stream=sys.stderr,
+)
+logger = logging.getLogger(__name__)
 
 ROOT = Path(__file__).resolve().parents[1]
 DATABASE_PATH = ROOT / "data" / "customer_master.sqlite3"
@@ -29,9 +38,10 @@ TABLE_SHEETS = {
     "sync_log": "Sync Log",
 }
 
-BATCH_ROWS = 200
 # Keep room for the process environment and gws arguments on small ARG_MAX
-# environments; transaction rows include a large raw_json column.
+# environments; transaction rows include a large raw_json column. The gws
+# fallback path also receives JSON as a CLI argument, so keep batches small.
+BATCH_ROWS = 40
 MAX_JSON_ARG_BYTES = 8_000
 
 
@@ -220,17 +230,46 @@ def mirror_table(store: ZeyDataStore, table: str, sheet_name: str, sheet_gid: in
 
 
 def mirror_all(store: ZeyDataStore, dry_run: bool = False) -> dict:
-    """Mirror all tables to Google Sheets."""
+    """Mirror all tables to Google Sheets. A failure on one table is logged
+    and recorded per-table; it does not abort the remaining tables."""
     results = {}
+    had_error = False
     sheet_ids = {} if dry_run else get_sheet_ids()
     for table, sheet_name in TABLE_SHEETS.items():
         if dry_run:
             df = store.export_table(table)
             results[table] = {"sheet": sheet_name, "rows": len(df), "status": "dry-run"}
-        else:
+            continue
+        try:
             results[table] = mirror_table(store, table, sheet_name, sheet_ids.get(sheet_name))
-    return {"status": "ok" if not dry_run else "dry-run", "sheets": results}
+            logger.info("mirrored %s -> %s (%d rows)", table, sheet_name, results[table]["rows"])
+        except Exception as exc:
+            had_error = True
+            logger.exception("failed to mirror %s -> %s", table, sheet_name)
+            results[table] = {"table": table, "sheet": sheet_name, "error": str(exc)}
+    if dry_run:
+        return {"status": "dry-run", "sheets": results}
+    return {"status": "error" if had_error else "ok", "sheets": results}
+
+
+def main() -> None:
+    if not DATABASE_PATH.exists():
+        logger.error("database not found at %s", DATABASE_PATH)
+        print(json.dumps({"status": "error", "message": f"Database not found: {DATABASE_PATH}"}))
+        sys.exit(1)
+
+    store = ZeyDataStore(DATABASE_PATH)
+    try:
+        result = mirror_all(store)
+    except Exception as exc:
+        logger.exception("mirror run failed")
+        print(json.dumps({"status": "error", "message": str(exc)}))
+        sys.exit(1)
+
+    print(json.dumps(result))
+    if result["status"] == "error":
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    print(json.dumps(mirror_all(ZeyDataStore(DATABASE_PATH))))
+    main()
