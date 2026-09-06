@@ -27,7 +27,8 @@ async function main() {
     () => document.body.innerText.includes('Zey Brow & Wax'),
   );
 
-  await browser.close();
+  // This is an externally managed browser. Closing a CDP connection here
+  // would terminate the shared authenticated browser before report exports.
   if (!authenticated) {
     throw new Error('Vagaro session is not authenticated. Re-login is required.');
   }

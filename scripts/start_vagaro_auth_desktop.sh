@@ -35,7 +35,9 @@ start_if_not_running() {
   if [[ -f "$pid_file" ]] && kill -0 "$(<"$pid_file")" 2>/dev/null; then
     return
   fi
-  "$@" &
+  # Detach the desktop processes from this shell so a scheduled/SSH launch
+  # does not terminate Chromium when the launcher exits.
+  setsid "$@" < /dev/null &
   echo $! > "$pid_file"
 }
 

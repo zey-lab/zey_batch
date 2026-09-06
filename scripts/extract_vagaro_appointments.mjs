@@ -95,7 +95,7 @@ async function main() {
   } finally {
     await cdp.send('Network.setBypassServiceWorker', { bypass: false }).catch(() => {});
     await cdp.detach().catch(() => {});
-    await browser.close();
+    // Leave the externally managed CDP browser running for the next export.
   }
 }
 
