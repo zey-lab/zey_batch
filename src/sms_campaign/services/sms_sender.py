@@ -49,6 +49,7 @@ class SMSSender:
         self.sent_count = 0
         self.failed_count = 0
         self.total_cost = 0.0
+        self.last_message_sid: Optional[str] = None
 
     def send_sms(self, to_phone: str, message: str) -> Tuple[bool, str, Optional[str]]:
         """Send an SMS message.
@@ -64,6 +65,7 @@ class SMSSender:
             # Simulate sending in dry-run mode
             time.sleep(0.1)  # Simulate network delay
             self.sent_count += 1
+            self.last_message_sid = None
             return True, "sent", None
 
         try:
@@ -73,6 +75,7 @@ class SMSSender:
                 from_=self.from_phone,
                 to=to_phone
             )
+            self.last_message_sid = getattr(message_obj, "sid", None)
 
             # Apply rate limiting
             time.sleep(self.rate_limit_delay)
@@ -94,11 +97,13 @@ class SMSSender:
                 return False, status, f"Message status: {status}"
 
         except TwilioRestException as e:
+            self.last_message_sid = None
             self.failed_count += 1
             error_msg = f"Twilio error: {e.msg}"
             return False, "failed", error_msg
 
         except Exception as e:
+            self.last_message_sid = None
             self.failed_count += 1
             error_msg = f"Unexpected error: {str(e)}"
             return False, "failed", error_msg
