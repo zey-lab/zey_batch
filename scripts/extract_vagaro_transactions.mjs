@@ -150,6 +150,7 @@ async function main() {
     }), { mode: 0o600 });
 
     process.stdout.write(JSON.stringify({ status: 'ok', output: OUTPUT_PATH, records: rows.length }) + '\n');
+    process.exit(0);
   } finally {
     page.off('request', requestHandler);
     await cdp.send('Network.setBypassServiceWorker', { bypass: false }).catch(() => {});

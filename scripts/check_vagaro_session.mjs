@@ -38,6 +38,10 @@ async function main() {
     authenticated: true,
     checkedAt: new Date().toISOString(),
   }) + '\n');
+  // Playwright's CDP socket can keep the Node event loop alive after the
+  // externally managed browser has been checked. Disconnect this short-lived
+  // probe explicitly without closing the remote browser.
+  process.exit(0);
 }
 
 main().catch((error) => {
