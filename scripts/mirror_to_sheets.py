@@ -237,9 +237,47 @@ def _cell_text(value: object) -> str:
     return str(value)
 
 
+def _expand_transaction_payload(frame, table: str):
+    """Expose all source fields when mirroring transactions.
+
+    Older live deployments may have the original data-store module, so keep
+    this expansion at the Sheet boundary as well as in the shared exporter.
+    """
+    if table != "transactions" or "raw_json" not in frame.columns:
+        return frame
+    source_rows = []
+    source_columns = []
+    for raw in frame["raw_json"]:
+        try:
+            payload = json.loads(raw) if raw else {}
+        except (TypeError, json.JSONDecodeError):
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        source_rows.append(payload)
+        for key in payload:
+            if key not in source_columns and key not in frame.columns:
+                source_columns.append(key)
+
+    frame = frame.assign(**{
+        key: [
+            json.dumps(payload[key], ensure_ascii=False)
+            if isinstance(payload.get(key), (dict, list))
+            else payload.get(key, "")
+            for payload in source_rows
+        ]
+        for key in source_columns
+    })
+    if source_columns:
+        base_columns = [column for column in frame.columns if column not in source_columns]
+        raw_index = base_columns.index("raw_json")
+        frame = frame[base_columns[:raw_index] + source_columns + base_columns[raw_index:]]
+    return frame
+
+
 def mirror_table(store: ZeyDataStore, table: str, sheet_name: str, sheet_gid: int | None = None) -> dict:
     """Mirror one SQLite table to one Google Sheet tab."""
-    df = store.export_table(table)
+    df = _expand_transaction_payload(store.export_table(table), table)
     df = df.fillna("")
 
     if df.empty:
@@ -297,7 +335,7 @@ def mirror_all_direct(store: ZeyDataStore, sheet_ids: dict[str, int]) -> dict:
     transaction_data = []
 
     for table, sheet_name in TABLE_SHEETS.items():
-        df = store.export_table(table).fillna("")
+        df = _expand_transaction_payload(store.export_table(table), table).fillna("")
         header = [str(c) for c in df.columns]
         rows = [[_cell_text(v) for v in row] for row in df.itertuples(index=False, name=None)]
         n_cols = max(len(header), 26)
