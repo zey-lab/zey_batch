@@ -46,6 +46,50 @@ BATCH_ROWS = 40
 MAX_JSON_ARG_BYTES = 8_000
 
 
+def ensure_access_token() -> None:
+    """Load a short-lived Sheets token from the persisted gws refresh token.
+
+    The watcher and scheduled jobs run without an interactive shell.  When
+    no token was injected into their environment, refresh the credentials
+    that ``gws auth login`` saved locally so large mirrors use the batched
+    REST path instead of dozens of quota-expensive CLI writes.
+    """
+    if os.getenv("GOOGLE_WORKSPACE_CLI_TOKEN"):
+        return
+
+    try:
+        exported = subprocess.run(
+            [GWS_PATH, "auth", "export", "--unmasked"],
+            check=True,
+            capture_output=True,
+            text=True,
+            env={**os.environ, "HOME": GWS_HOME},
+        )
+        credentials = json.loads(exported.stdout)
+        form = urllib.parse.urlencode({
+            "client_id": credentials["client_id"],
+            "client_secret": credentials["client_secret"],
+            "refresh_token": credentials["refresh_token"],
+            "grant_type": "refresh_token",
+        }).encode("utf-8")
+        request = urllib.request.Request(
+            "https://oauth2.googleapis.com/token",
+            data=form,
+            method="POST",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        with urllib.request.urlopen(request, timeout=30) as response:
+            token = json.loads(response.read().decode("utf-8")).get("access_token")
+        if not token:
+            raise RuntimeError("OAuth refresh response did not contain an access token")
+        os.environ["GOOGLE_WORKSPACE_CLI_TOKEN"] = token
+    except Exception as exc:
+        # The gws fallback remains useful when the persisted credentials are
+        # unavailable, so do not make a small deployment environment issue
+        # prevent the mirror from attempting its normal path.
+        logger.warning("could not refresh gws token for batched mirror: %s", exc)
+
+
 def sheets_api(path: str, method: str = "GET", payload: dict | None = None) -> dict:
     """Call the Sheets REST API with the short-lived OAuth access token."""
     token = os.getenv("GOOGLE_WORKSPACE_CLI_TOKEN")
@@ -332,6 +376,7 @@ def main() -> None:
         print(json.dumps({"status": "error", "message": f"Database not found: {DATABASE_PATH}"}))
         sys.exit(1)
 
+    ensure_access_token()
     store = ZeyDataStore(DATABASE_PATH)
     try:
         result = mirror_all(store)

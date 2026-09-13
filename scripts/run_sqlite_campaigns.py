@@ -13,7 +13,7 @@ import json
 import os
 from pathlib import Path
 
-from mirror_to_sheets import mirror_all
+from mirror_to_sheets import ensure_access_token, mirror_all
 from sms_campaign.data_store import ZeyDataStore
 from sms_campaign.services.sms_sender import SMSSender
 from sms_campaign.sqlite_campaigns import SQLiteCampaignRunner
@@ -71,6 +71,7 @@ def main() -> int:
     if args.mirror:
         if not args.live:
             parser.error("--mirror requires --live so the sheet contains only durable send results")
+        ensure_access_token()
         output["mirror"] = mirror_all(runner.store)
     print(json.dumps(output, default=str, indent=2))
     return 0
