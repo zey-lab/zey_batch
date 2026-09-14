@@ -40,6 +40,17 @@ class TestSupabaseMirror(unittest.TestCase):
         self.assertIn("on_conflict=transaction_id", first.full_url)
         self.assertEqual(first.get_header("Authorization"), "Bearer secret")
 
+    @patch("sms_campaign.supabase_mirror.urllib.request.urlopen", return_value=_Response())
+    def test_transaction_export_only_sends_relational_columns(self, urlopen) -> None:
+        mirror = SupabaseMirror("https://example.supabase.co", "secret")
+        mirror.mirror_table(
+            "campaigns", "campaign_id",
+            pd.DataFrame([{"campaign_id": 1, "rank": "15.0", "unexpected": "ignored"}]),
+        )
+        payload = json.loads(urlopen.call_args.args[0].data)
+        self.assertEqual(payload[0]["rank"], 15)
+        self.assertNotIn("unexpected", payload[0])
+
 
 if __name__ == "__main__":
     unittest.main()
