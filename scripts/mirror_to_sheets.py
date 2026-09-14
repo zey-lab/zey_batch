@@ -245,6 +245,21 @@ def _expand_transaction_payload(frame, table: str):
     """
     if table != "transactions" or "raw_json" not in frame.columns:
         return frame
+
+    # Compact webhook receipts are retained in webhook_events and are not
+    # complete report rows. Keep them out of the canonical workbook even if a
+    # receiver from an older deployment has already inserted one.
+    def is_partial(raw: object) -> bool:
+        try:
+            payload = json.loads(raw) if raw else {}
+        except (TypeError, json.JSONDecodeError):
+            return False
+        return isinstance(payload, dict) and "TransactionType" in payload and "TranType" not in payload
+
+    partial = frame["raw_json"].map(is_partial)
+    if partial.any():
+        frame = frame.loc[~partial].reset_index(drop=True)
+
     source_rows = []
     source_columns = []
     for raw in frame["raw_json"]:
@@ -302,7 +317,9 @@ def mirror_table(store: ZeyDataStore, table: str, sheet_name: str, sheet_gid: in
         run_gws(
             "sheets", "spreadsheets", "values", "batchClear",
             "--params", json.dumps({"spreadsheetId": SHEET_ID}),
-            "--json", json.dumps({"ranges": [f"{sheet_name}!A2:{last_col}"]}),
+            # Clear a fixed wide range so columns left by an older, wider
+            # transaction schema cannot remain visible after a schema change.
+            "--json", json.dumps({"ranges": [f"{sheet_name}!A1:ZZ"]}),
         )
 
     # Write header at a fixed range (not append — append skips rows with
@@ -340,7 +357,9 @@ def mirror_all_direct(store: ZeyDataStore, sheet_ids: dict[str, int]) -> dict:
         rows = [[_cell_text(v) for v in row] for row in df.itertuples(index=False, name=None)]
         n_cols = max(len(header), 26)
         last_col = _col_letter(max(n_cols, 78))
-        clear_ranges.append(f"{sheet_name}!A2:{last_col}")
+        # Clear beyond the current width to remove stale headers/values from
+        # older mirrors that had a wider schema.
+        clear_ranges.append(f"{sheet_name}!A1:ZZ")
         if sheet_name in sheet_ids:
             grid_requests.append({
                 "updateSheetProperties": {

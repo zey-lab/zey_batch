@@ -68,6 +68,21 @@ class TestMirrorAll(unittest.TestCase):
         # Customers table.
         self.assertLessEqual(mirror_to_sheets.BATCH_ROWS, 100)
 
+    def test_partial_webhook_rows_are_excluded_from_the_workbook(self) -> None:
+        frame = pd.DataFrame(
+            {
+                "transaction_id": [1, 2],
+                "raw_json": [
+                    '{"TranType":"A","ID":123}',
+                    '{"TransactionType":"Service","ID":"opaque"}',
+                ],
+            }
+        )
+
+        cleaned = mirror_to_sheets._expand_transaction_payload(frame, "transactions")
+
+        self.assertEqual(cleaned["transaction_id"].tolist(), [1])
+
 
 if __name__ == "__main__":
     unittest.main()

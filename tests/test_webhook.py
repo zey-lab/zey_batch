@@ -12,7 +12,7 @@ from sms_campaign.webhook import WebhookError, WebhookProcessor
 
 
 class TestWebhookProcessor(unittest.TestCase):
-    def test_transaction_is_stored_and_duplicate_is_idempotent(self) -> None:
+    def test_partial_transaction_is_retained_without_polluting_canonical_table(self) -> None:
         with TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "zey.sqlite3"
             processor = WebhookProcessor(db_path, "secret")
@@ -40,12 +40,12 @@ class TestWebhookProcessor(unittest.TestCase):
             second = processor.process({"X-Vagaro-Verification-Token": "secret"}, body)
 
             self.assertEqual(first["status"], "accepted")
+            self.assertEqual(first["transaction_sync"], "deferred_to_complete_snapshot")
             self.assertEqual(second, {"status": "duplicate", "event_id": "event-1"})
 
             conn = sqlite3.connect(db_path)
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM webhook_events").fetchone()[0], 1)
-            self.assertEqual(conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0], 1)
-            self.assertIsNotNone(conn.execute("SELECT customer_id FROM transactions").fetchone()[0])
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0], 0)
             conn.close()
 
     def test_invalid_token_is_rejected_before_persisting(self) -> None:
