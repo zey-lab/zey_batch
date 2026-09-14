@@ -770,6 +770,7 @@ class ZeyDataStore:
                 "transactions_total": conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0],
                 "employees_active": conn.execute("SELECT COUNT(*) FROM employees WHERE active=1").fetchone()[0],
                 "sms_sent_total": conn.execute("SELECT COUNT(*) FROM sms_history").fetchone()[0],
+                "email_sent_total": conn.execute("SELECT COUNT(*) FROM email_history").fetchone()[0],
                 "campaigns_active": conn.execute("SELECT COUNT(*) FROM campaigns WHERE active=1").fetchone()[0],
                 "last_sync": conn.execute("SELECT MAX(sync_date) FROM sync_log").fetchone()[0],
             }
