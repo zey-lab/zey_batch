@@ -87,10 +87,11 @@ async function main() {
     }), { mode: 0o600 });
 
     process.stdout.write(JSON.stringify({ status: 'ok', output: OUTPUT_PATH, records: deduplicated.length, pages: pageCount }) + '\n');
+    process.exit(0);
   } finally {
     await cdp.send('Network.setBypassServiceWorker', { bypass: false }).catch(() => {});
     await cdp.detach().catch(() => {});
-    await browser.close();
+    // Leave the externally managed CDP browser running for the next export.
   }
 }
 

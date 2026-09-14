@@ -1,18 +1,7 @@
 #!/bin/bash
-# Quick run script for SMS Campaign Manager
+# Scheduled entry point for the unified SQLite campaign pipeline.
+# It is dry-run by default; production scheduling must pass --live and set
+# SMS_LIVE_APPROVED=true in the server-only environment.
+set -euo pipefail
 
-echo "=================================================="
-echo "Step 1: Syncing Opt-Outs from Twilio..."
-echo "=================================================="
-uv run python -m sms_campaign.sync_opt_outs
-
-if [ $? -eq 0 ]; then
-    echo ""
-    echo "=================================================="
-    echo "Step 2: Starting Campaign Manager..."
-    echo "=================================================="
-    uv run python -m sms_campaign.cli "$@"
-else
-    echo "Opt-out sync failed. Aborting campaign to prevent sending to opted-out customers."
-    exit 1
-fi
+exec uv run python scripts/run_sqlite_campaigns.py "$@"

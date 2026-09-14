@@ -566,6 +566,34 @@ class ZeyDataStore:
         finally:
             conn.close()
 
+    def log_email(
+        self,
+        customer_id: int,
+        campaign_type: str,
+        subject: str,
+        body: str,
+        status: str,
+        error_message: str | None = None,
+        campaign_row: int | None = None,
+    ) -> None:
+        """Log an email attempt without mixing it into SMS history."""
+        conn = self._conn()
+        try:
+            conn.execute(
+                """INSERT INTO email_history
+                    (customer_id, campaign_type, subject, body, status,
+                     error_message, campaign_row)
+                VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (customer_id, campaign_type, subject, body, status, error_message, campaign_row),
+            )
+            conn.execute(
+                "UPDATE customers SET updated_at=datetime('now') WHERE customer_id=?",
+                (customer_id,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
     # ── Campaigns ──────────────────────────────────────────────
 
     def load_campaigns(self) -> pd.DataFrame:
@@ -606,6 +634,9 @@ class ZeyDataStore:
                     "rank": self._int(row.get("Rank", 999)),
                     "process_date": self._str(row.get("Campaign Process Date")),
                     "process_status": self._str(row.get("Campaign Process Status")),
+                    "channels": self._str(row.get("Channels", row.get("Channel", "sms"))) or "sms",
+                    "email_subject": self._str(row.get("Email Subject")),
+                    "email_html": self._str(row.get("Email HTML")),
                 }
 
                 # Check if similar campaign exists (by text_prompt + type)
@@ -622,6 +653,8 @@ class ZeyDataStore:
                             filter_last_sms_days=:filter_last_sms_days,
                             rank=:rank, process_date=:process_date,
                             process_status=:process_status,
+                            channels=:channels, email_subject=:email_subject,
+                            email_html=:email_html,
                             updated_at=datetime('now')
                         WHERE campaign_id=:campaign_id""",
                         {**data, "campaign_id": existing["campaign_id"]},
@@ -632,11 +665,13 @@ class ZeyDataStore:
                         """INSERT INTO campaigns
                             (text_prompt, character_limit, campaign_type,
                              filter_last_visit_days, filter_last_sms_days,
-                             rank, process_date, process_status)
+                             rank, process_date, process_status,
+                             channels, email_subject, email_html)
                         VALUES
                             (:text_prompt, :character_limit, :campaign_type,
                              :filter_last_visit_days, :filter_last_sms_days,
-                             :rank, :process_date, :process_status)""",
+                            :rank, :process_date, :process_status,
+                            :channels, :email_subject, :email_html)""",
                         data,
                     )
                     result.inserted += 1
@@ -679,9 +714,49 @@ class ZeyDataStore:
         """Export any table as a DataFrame for Google Sheets mirroring."""
         conn = self._conn()
         try:
-            return pd.read_sql_query(f"SELECT * FROM {table}", conn)
+            frame = pd.read_sql_query(f"SELECT * FROM {table}", conn)
         finally:
             conn.close()
+
+        if table != "transactions" or "raw_json" not in frame.columns:
+            return frame
+
+        # Keep the normalized transaction fields for joins and reporting, but
+        # also expose every field from Vagaro's original line-item payload.
+        # Previously those fields were only visible inside raw_json, which
+        # made the Sheet appear to lose values such as ServiceName, Price,
+        # CheckedOutByID, and payment breakdowns.
+        source_rows: list[dict] = []
+        source_columns: list[str] = []
+        for raw in frame["raw_json"]:
+            try:
+                payload = json.loads(raw) if raw else {}
+            except (TypeError, json.JSONDecodeError):
+                payload = {}
+            if not isinstance(payload, dict):
+                payload = {}
+            source_rows.append(payload)
+            for key in payload:
+                if key not in source_columns and key not in frame.columns:
+                    source_columns.append(key)
+
+        frame = frame.assign(**{
+            key: [
+                json.dumps(payload[key], ensure_ascii=False)
+                if isinstance(payload.get(key), (dict, list))
+                else payload.get(key, "")
+                for payload in source_rows
+            ]
+            for key in source_columns
+        })
+
+        if source_columns:
+            base_columns = [column for column in frame.columns if column not in source_columns]
+            raw_index = base_columns.index("raw_json")
+            frame = frame[
+                base_columns[:raw_index] + source_columns + base_columns[raw_index:]
+            ]
+        return frame
 
     def get_stats(self) -> dict:
         """Get summary statistics."""
@@ -695,6 +770,7 @@ class ZeyDataStore:
                 "transactions_total": conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0],
                 "employees_active": conn.execute("SELECT COUNT(*) FROM employees WHERE active=1").fetchone()[0],
                 "sms_sent_total": conn.execute("SELECT COUNT(*) FROM sms_history").fetchone()[0],
+                "email_sent_total": conn.execute("SELECT COUNT(*) FROM email_history").fetchone()[0],
                 "campaigns_active": conn.execute("SELECT COUNT(*) FROM campaigns WHERE active=1").fetchone()[0],
                 "last_sync": conn.execute("SELECT MAX(sync_date) FROM sync_log").fetchone()[0],
             }

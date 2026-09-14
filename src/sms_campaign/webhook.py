@@ -103,6 +103,16 @@ class WebhookProcessor:
 
     def _ingest(self, event_type: str, payload: dict) -> dict[str, object]:
         if event_type == "transaction":
+            # Vagaro transaction webhooks are compact and do not reliably
+            # include customer/staff names or the complete report fields.
+            # Retain the raw event above, but do not expose a partial event as
+            # a canonical transaction row in the workbook.
+            if not self._has_complete_transaction(payload):
+                return {
+                    "derived_table": "webhook_events",
+                    "transaction_sync": "deferred_to_complete_snapshot",
+                }
+
             row = {
                 "ID": payload.get("transactionId"),
                 "TransactionDate": payload.get("transactionDate"),
@@ -150,6 +160,20 @@ class WebhookProcessor:
         # A customer webhook is retained verbatim and reconciled by the daily
         # customer snapshot. A one-row event must not deactivate other customers.
         return {"derived_table": "webhook_events", "customer_sync": "deferred_to_snapshot"}
+
+    @classmethod
+    def _has_complete_transaction(cls, payload: dict) -> bool:
+        """Return whether a webhook has enough detail for the canonical table."""
+        required_text = (
+            "transactionId",
+            "transactionDate",
+            "customerId",
+            "customerName",
+            "itemSold",
+        )
+        if not all(cls._text(payload.get(key)) for key in required_text):
+            return False
+        return payload.get("totalAmount") is not None or payload.get("amountPaid") is not None
 
     def _mark(self, event_id: str, status: str, error: str | None) -> None:
         conn = sqlite3.connect(str(self.db_path))

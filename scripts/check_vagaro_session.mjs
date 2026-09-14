@@ -27,7 +27,8 @@ async function main() {
     () => document.body.innerText.includes('Zey Brow & Wax'),
   );
 
-  await browser.close();
+  // This is an externally managed browser. Closing a CDP connection here
+  // would terminate the shared authenticated browser before report exports.
   if (!authenticated) {
     throw new Error('Vagaro session is not authenticated. Re-login is required.');
   }
@@ -37,6 +38,10 @@ async function main() {
     authenticated: true,
     checkedAt: new Date().toISOString(),
   }) + '\n');
+  // Playwright's CDP socket can keep the Node event loop alive after the
+  // externally managed browser has been checked. Disconnect this short-lived
+  // probe explicitly without closing the remote browser.
+  process.exit(0);
 }
 
 main().catch((error) => {

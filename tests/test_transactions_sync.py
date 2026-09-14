@@ -76,6 +76,27 @@ class TestTransactionsSync(unittest.TestCase):
         self.assertEqual(result.inserted, 0)
         self.assertEqual(len(result.errors or []), 1)
 
+    def test_transaction_export_expands_the_original_vagaro_payload(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            store = ZeyDataStore(Path(temp_dir) / "zey.sqlite3")
+            store.sync_transactions(
+                pd.DataFrame([{
+                    "ID": "TXN-1",
+                    "CustomerID": 42,
+                    "ServiceName": "Threading - Brow Shaping",
+                    "ServiceProviderName": "Zey",
+                    "Price": 120,
+                    "IsOnlinePayment": False,
+                }])
+            )
+            table = store.export_table("transactions")
+
+        self.assertEqual(table.iloc[0]["ID"], "TXN-1")
+        self.assertEqual(table.iloc[0]["CustomerID"], 42)
+        self.assertEqual(table.iloc[0]["ServiceName"], "Threading - Brow Shaping")
+        self.assertEqual(table.iloc[0]["Price"], 120)
+        self.assertFalse(table.iloc[0]["IsOnlinePayment"])
+
     def test_empty_dataframe_is_a_no_op(self) -> None:
         with TemporaryDirectory() as temp_dir:
             store = ZeyDataStore(Path(temp_dir) / "zey.sqlite3")

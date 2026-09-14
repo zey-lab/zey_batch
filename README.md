@@ -9,12 +9,14 @@ A robust, automated SMS campaign management system designed to handle customer e
 *   **Data Merging:** Intelligently merges new customer lists with existing data, preserving history and opt-out status.
 *   **Cost Optimization:** Analyzes message length and encoding (GSM-7 vs Unicode) to minimize segment costs.
 *   **Safety First:** Includes "Dry Run" mode and Test Number filtering to prevent accidental blasts.
+*   **Separate Email Channel:** Optional Gmail API campaigns use their own opt-out and `email_history` records; Twilio is never used for email.
 
 ## Prerequisites
 
 *   Python 3.11 or higher
 *   [uv](https://github.com/astral-sh/uv) (Fast Python package installer and resolver)
-*   A Twilio Account (SID, Auth Token, and Phone Number)
+*   A Twilio Account (SID, Auth Token, and Phone Number) for SMS
+*   A Google mailbox authorized for Gmail API sending for email
 
 ## Installation & Setup
 
@@ -72,6 +74,36 @@ You can also run individual components using `uv run`:
     ```bash
     uv run python -m sms_campaign.cli
     ```
+
+### Email campaigns
+
+Email is opt-in per campaign and is disabled unless a campaign's `Channels`
+column contains `email` or `both`. Add `Email Subject` and optionally `Email
+HTML` to the Campaigns sheet. If `Email HTML` is blank, the runner uses a
+responsive Zey Brow-colored template. Set `EMAIL_LOGO_URL` only to an approved
+public logo asset; the system does not guess a logo path from the website.
+
+The first command is a preview and cannot send mail:
+
+```bash
+uv run python scripts/run_email_campaigns.py --campaign-id 1 --test-email owner@example.com
+```
+
+Live mode is separately gated by `EMAIL_LIVE_APPROVED=true` and requires a
+server-only Gmail OAuth configuration. Use the Google OAuth account that owns
+`EMAIL_FROM` (currently planned as `zeybrowwax@gmail.com`) and grant only the
+Gmail send scope. Store `GMAIL_CLIENT_ID`, `GMAIL_CLIENT_SECRET`, and
+`GMAIL_REFRESH_TOKEN` in the protected service environment; never put them in
+Git, a spreadsheet, or an issue comment. A verified Gmail “Send mail as” alias
+is required if the visible From address differs from the authenticated mailbox.
+
+```bash
+EMAIL_LIVE_APPROVED=true uv run python scripts/run_email_campaigns.py --live --campaign-id 1 --test-email owner@example.com
+```
+
+The runner records every live attempt in `email_history` and mirrors that table
+to Supabase/Google Sheets on the existing mirror jobs. No live email is sent
+as part of installation or deployment.
 
 ### Development
 To run tests or check for security leaks:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import subprocess
 import sys
@@ -43,6 +44,50 @@ TABLE_SHEETS = {
 # fallback path also receives JSON as a CLI argument, so keep batches small.
 BATCH_ROWS = 40
 MAX_JSON_ARG_BYTES = 8_000
+
+
+def ensure_access_token() -> None:
+    """Load a short-lived Sheets token from the persisted gws refresh token.
+
+    The watcher and scheduled jobs run without an interactive shell.  When
+    no token was injected into their environment, refresh the credentials
+    that ``gws auth login`` saved locally so large mirrors use the batched
+    REST path instead of dozens of quota-expensive CLI writes.
+    """
+    if os.getenv("GOOGLE_WORKSPACE_CLI_TOKEN"):
+        return
+
+    try:
+        exported = subprocess.run(
+            [GWS_PATH, "auth", "export", "--unmasked"],
+            check=True,
+            capture_output=True,
+            text=True,
+            env={**os.environ, "HOME": GWS_HOME},
+        )
+        credentials = json.loads(exported.stdout)
+        form = urllib.parse.urlencode({
+            "client_id": credentials["client_id"],
+            "client_secret": credentials["client_secret"],
+            "refresh_token": credentials["refresh_token"],
+            "grant_type": "refresh_token",
+        }).encode("utf-8")
+        request = urllib.request.Request(
+            "https://oauth2.googleapis.com/token",
+            data=form,
+            method="POST",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        with urllib.request.urlopen(request, timeout=30) as response:
+            token = json.loads(response.read().decode("utf-8")).get("access_token")
+        if not token:
+            raise RuntimeError("OAuth refresh response did not contain an access token")
+        os.environ["GOOGLE_WORKSPACE_CLI_TOKEN"] = token
+    except Exception as exc:
+        # The gws fallback remains useful when the persisted credentials are
+        # unavailable, so do not make a small deployment environment issue
+        # prevent the mirror from attempting its normal path.
+        logger.warning("could not refresh gws token for batched mirror: %s", exc)
 
 
 def sheets_api(path: str, method: str = "GET", payload: dict | None = None) -> dict:
@@ -185,16 +230,76 @@ def _col_letter(n: int) -> str:
     return letters
 
 
+def _cell_text(value: object) -> str:
+    """Render integer-valued floats (nullable SQLite integers) without .0."""
+    if isinstance(value, float) and math.isfinite(value) and value.is_integer():
+        return str(int(value))
+    return str(value)
+
+
+def _expand_transaction_payload(frame, table: str):
+    """Expose all source fields when mirroring transactions.
+
+    Older live deployments may have the original data-store module, so keep
+    this expansion at the Sheet boundary as well as in the shared exporter.
+    """
+    if table != "transactions" or "raw_json" not in frame.columns:
+        return frame
+
+    # Compact webhook receipts are retained in webhook_events and are not
+    # complete report rows. Keep them out of the canonical workbook even if a
+    # receiver from an older deployment has already inserted one.
+    def is_partial(raw: object) -> bool:
+        try:
+            payload = json.loads(raw) if raw else {}
+        except (TypeError, json.JSONDecodeError):
+            return False
+        return isinstance(payload, dict) and "TransactionType" in payload and "TranType" not in payload
+
+    partial = frame["raw_json"].map(is_partial)
+    if partial.any():
+        frame = frame.loc[~partial].reset_index(drop=True)
+
+    source_rows = []
+    source_columns = []
+    for raw in frame["raw_json"]:
+        try:
+            payload = json.loads(raw) if raw else {}
+        except (TypeError, json.JSONDecodeError):
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        source_rows.append(payload)
+        for key in payload:
+            if key not in source_columns and key not in frame.columns:
+                source_columns.append(key)
+
+    frame = frame.assign(**{
+        key: [
+            json.dumps(payload[key], ensure_ascii=False)
+            if isinstance(payload.get(key), (dict, list))
+            else payload.get(key, "")
+            for payload in source_rows
+        ]
+        for key in source_columns
+    })
+    if source_columns:
+        base_columns = [column for column in frame.columns if column not in source_columns]
+        raw_index = base_columns.index("raw_json")
+        frame = frame[base_columns[:raw_index] + source_columns + base_columns[raw_index:]]
+    return frame
+
+
 def mirror_table(store: ZeyDataStore, table: str, sheet_name: str, sheet_gid: int | None = None) -> dict:
     """Mirror one SQLite table to one Google Sheet tab."""
-    df = store.export_table(table)
+    df = _expand_transaction_payload(store.export_table(table), table)
     df = df.fillna("")
 
     if df.empty:
         return {"table": table, "sheet": sheet_name, "rows": 0}
 
     header = [str(c) for c in df.columns]
-    rows = [[str(v) for v in row] for row in df.itertuples(index=False, name=None)]
+    rows = [[_cell_text(v) for v in row] for row in df.itertuples(index=False, name=None)]
     n_cols = max(len(header), 26)
     last_col = _col_letter(max(n_cols, 78))  # BZ = 78
 
@@ -212,7 +317,9 @@ def mirror_table(store: ZeyDataStore, table: str, sheet_name: str, sheet_gid: in
         run_gws(
             "sheets", "spreadsheets", "values", "batchClear",
             "--params", json.dumps({"spreadsheetId": SHEET_ID}),
-            "--json", json.dumps({"ranges": [f"{sheet_name}!A2:{last_col}"]}),
+            # Clear a fixed wide range so columns left by an older, wider
+            # transaction schema cannot remain visible after a schema change.
+            "--json", json.dumps({"ranges": [f"{sheet_name}!A1:ZZ"]}),
         )
 
     # Write header at a fixed range (not append — append skips rows with
@@ -229,12 +336,80 @@ def mirror_table(store: ZeyDataStore, table: str, sheet_name: str, sheet_gid: in
     return {"table": table, "sheet": sheet_name, "rows": len(rows)}
 
 
+def mirror_all_direct(store: ZeyDataStore, sheet_ids: dict[str, int]) -> dict:
+    """Mirror all tabs with three REST writes instead of one per batch.
+
+    The direct API path is used when a short-lived access token is available.
+    Sending one batchClear, one grid-properties batchUpdate, and one values
+    batchUpdate keeps a large historical transaction import below Sheets'
+    per-minute write-request quota.  The gws fallback retains its smaller
+    argv-safe batches in ``mirror_table``.
+    """
+    results: dict[str, dict] = {}
+    clear_ranges = []
+    grid_requests = []
+    value_data = []
+    transaction_data = []
+
+    for table, sheet_name in TABLE_SHEETS.items():
+        df = _expand_transaction_payload(store.export_table(table), table).fillna("")
+        header = [str(c) for c in df.columns]
+        rows = [[_cell_text(v) for v in row] for row in df.itertuples(index=False, name=None)]
+        n_cols = max(len(header), 26)
+        last_col = _col_letter(max(n_cols, 78))
+        # Clear beyond the current width to remove stale headers/values from
+        # older mirrors that had a wider schema.
+        clear_ranges.append(f"{sheet_name}!A1:ZZ")
+        if sheet_name in sheet_ids:
+            grid_requests.append({
+                "updateSheetProperties": {
+                    "properties": {
+                        "sheetId": sheet_ids[sheet_name],
+                        "gridProperties": {
+                            "columnCount": max(n_cols + 5, 60),
+                            "rowCount": len(rows) + 5,
+                        },
+                    },
+                    "fields": "gridProperties.columnCount,gridProperties.rowCount",
+                },
+            })
+
+        results[table] = {"table": table, "sheet": sheet_name, "rows": len(rows)}
+        if header:
+            value = {
+                "range": f"{sheet_name}!A1:{_col_letter(len(header))}{len(rows) + 1}",
+                "majorDimension": "ROWS",
+                "values": [header, *rows],
+            }
+            (transaction_data if table == "transactions" else value_data).append(value)
+
+    if clear_ranges:
+        sheets_api("/values:batchClear", method="POST", payload={"ranges": clear_ranges})
+    if grid_requests:
+        sheets_api(":batchUpdate", method="POST", payload={"requests": grid_requests})
+    if value_data:
+        sheets_api(
+            "/values:batchUpdate",
+            method="POST",
+            payload={"valueInputOption": "RAW", "data": value_data},
+        )
+    if transaction_data:
+        sheets_api(
+            "/values:batchUpdate",
+            method="POST",
+            payload={"valueInputOption": "RAW", "data": transaction_data},
+        )
+    return {"status": "ok", "sheets": results}
+
+
 def mirror_all(store: ZeyDataStore, dry_run: bool = False) -> dict:
     """Mirror all tables to Google Sheets. A failure on one table is logged
     and recorded per-table; it does not abort the remaining tables."""
     results = {}
     had_error = False
     sheet_ids = {} if dry_run else get_sheet_ids()
+    if not dry_run and os.getenv("GOOGLE_WORKSPACE_CLI_TOKEN"):
+        return mirror_all_direct(store, sheet_ids)
     for table, sheet_name in TABLE_SHEETS.items():
         if dry_run:
             df = store.export_table(table)
@@ -258,6 +433,7 @@ def main() -> None:
         print(json.dumps({"status": "error", "message": f"Database not found: {DATABASE_PATH}"}))
         sys.exit(1)
 
+    ensure_access_token()
     store = ZeyDataStore(DATABASE_PATH)
     try:
         result = mirror_all(store)

@@ -29,6 +29,7 @@ const SCRIPTS = {
   syncEmployees: `${ROOT}/scripts/sync_employees.py`,
   syncTransactions: `${ROOT}/scripts/sync_transactions.py`,
   syncCampaigns: `${ROOT}/scripts/sync_campaigns.py`,
+  syncSupabase: `${ROOT}/scripts/sync_to_supabase.py`,
   mirror: `${ROOT}/scripts/mirror_to_sheets.py`,
   backup: `${ROOT}/scripts/backup_to_drive.py`,
 };
@@ -104,14 +105,18 @@ if (!report.steps.syncTransactions || report.steps.syncTransactions.error) halt(
 report.steps.syncCampaigns = parseJson(run(`uv run python ${SCRIPTS.syncCampaigns}`));
 if (!report.steps.syncCampaigns || report.steps.syncCampaigns.error) halt(report, 'syncCampaigns');
 
-// Step 4: Mirror all tables to Google Sheets — gated on successful sync above
+// Step 4: Mirror committed SQLite rows to Supabase. This is best-effort so
+// Supabase or its network cannot stop the local SQLite/Vagaro pipeline.
+report.steps.supabase = parseJson(run(`uv run python ${SCRIPTS.syncSupabase}`));
+
+// Step 5: Mirror all tables to Google Sheets — gated on successful sync above
 report.steps.mirror = parseJson(run(`uv run python ${SCRIPTS.mirror}`));
 if (!report.steps.mirror || report.steps.mirror.error) halt(report, 'mirror');
 
-// Step 5: Backup SQLite to Google Drive
+// Step 6: Backup SQLite to Google Drive
 report.steps.backup = parseJson(run(`uv run python ${SCRIPTS.backup}`));
 
-// Step 6: Get final stats
+// Step 7: Get final stats
 report.steps.stats = parseJson(run(`uv run python -c "
 from sms_campaign.data_store import ZeyDataStore
 from pathlib import Path

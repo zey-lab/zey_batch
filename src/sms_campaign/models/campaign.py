@@ -8,7 +8,7 @@ from dateutil import parser
 
 
 class Campaign:
-    """Represents a single SMS campaign."""
+    """Represents one campaign, with independent SMS/email channels."""
 
     def __init__(self, row_index: int, data: Dict[str, Any], column_config: Dict[str, str]):
         """Initialize campaign from row data.
@@ -31,6 +31,9 @@ class Campaign:
         self.rank = self._get_field('rank', 999)  # Default to high number (low priority)
         self.process_date = self._get_field('process_date', None)
         self.process_status = self._get_field('process_status', None)
+        self.channels = str(self._get_field('channels', 'sms') or 'sms').strip().lower()
+        self.email_subject = str(self._get_field('email_subject', '') or '')
+        self.email_html = str(self._get_field('email_html', '') or '')
 
         # Parse numeric filters
         if self.rank is not None:
@@ -127,6 +130,14 @@ class Campaign:
         if not self.campaign_type:
             return False
         return 'review' in str(self.campaign_type).lower()
+
+    def supports_channel(self, channel: str) -> bool:
+        """Return whether this campaign is enabled for ``sms`` or ``email``."""
+        requested = channel.strip().lower()
+        values = {part.strip() for part in self.channels.replace(';', ',').split(',') if part.strip()}
+        if not values:
+            values = {'sms'}
+        return requested in values or 'both' in values or 'all' in values
 
     def __repr__(self) -> str:
         """String representation of campaign."""
