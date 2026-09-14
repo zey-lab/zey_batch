@@ -566,6 +566,34 @@ class ZeyDataStore:
         finally:
             conn.close()
 
+    def log_email(
+        self,
+        customer_id: int,
+        campaign_type: str,
+        subject: str,
+        body: str,
+        status: str,
+        error_message: str | None = None,
+        campaign_row: int | None = None,
+    ) -> None:
+        """Log an email attempt without mixing it into SMS history."""
+        conn = self._conn()
+        try:
+            conn.execute(
+                """INSERT INTO email_history
+                    (customer_id, campaign_type, subject, body, status,
+                     error_message, campaign_row)
+                VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (customer_id, campaign_type, subject, body, status, error_message, campaign_row),
+            )
+            conn.execute(
+                "UPDATE customers SET updated_at=datetime('now') WHERE customer_id=?",
+                (customer_id,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
     # ── Campaigns ──────────────────────────────────────────────
 
     def load_campaigns(self) -> pd.DataFrame:
@@ -606,6 +634,9 @@ class ZeyDataStore:
                     "rank": self._int(row.get("Rank", 999)),
                     "process_date": self._str(row.get("Campaign Process Date")),
                     "process_status": self._str(row.get("Campaign Process Status")),
+                    "channels": self._str(row.get("Channels", row.get("Channel", "sms"))) or "sms",
+                    "email_subject": self._str(row.get("Email Subject")),
+                    "email_html": self._str(row.get("Email HTML")),
                 }
 
                 # Check if similar campaign exists (by text_prompt + type)
@@ -622,6 +653,8 @@ class ZeyDataStore:
                             filter_last_sms_days=:filter_last_sms_days,
                             rank=:rank, process_date=:process_date,
                             process_status=:process_status,
+                            channels=:channels, email_subject=:email_subject,
+                            email_html=:email_html,
                             updated_at=datetime('now')
                         WHERE campaign_id=:campaign_id""",
                         {**data, "campaign_id": existing["campaign_id"]},
@@ -632,11 +665,13 @@ class ZeyDataStore:
                         """INSERT INTO campaigns
                             (text_prompt, character_limit, campaign_type,
                              filter_last_visit_days, filter_last_sms_days,
-                             rank, process_date, process_status)
+                             rank, process_date, process_status,
+                             channels, email_subject, email_html)
                         VALUES
                             (:text_prompt, :character_limit, :campaign_type,
                              :filter_last_visit_days, :filter_last_sms_days,
-                             :rank, :process_date, :process_status)""",
+                            :rank, :process_date, :process_status,
+                            :channels, :email_subject, :email_html)""",
                         data,
                     )
                     result.inserted += 1

@@ -37,8 +37,8 @@ TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
     "employees": ("employee_id", "vagaro_emp_id", "name", "role", "phone", "email", "active", "schedule_json", "created_at", "updated_at"),
     "transactions": ("transaction_id", "vagaro_transaction_id", "customer_id", "customer_name", "employee_name", "transaction_date", "transaction_type", "payment_method", "subtotal", "tax", "tip", "discount", "total_amount", "status", "notes", "raw_json", "created_at"),
     "sms_history": ("sms_id", "customer_id", "campaign_type", "message_text", "sent_at", "status", "twilio_sid", "error_message", "campaign_row", "created_at"),
-    "email_history": ("email_id", "customer_id", "campaign_type", "subject", "body", "sent_at", "status", "error_message", "created_at"),
-    "campaigns": ("campaign_id", "text_prompt", "character_limit", "campaign_type", "filter_last_visit_days", "filter_last_sms_days", "rank", "process_date", "process_status", "active", "created_at", "updated_at"),
+    "email_history": ("email_id", "customer_id", "campaign_type", "subject", "body", "sent_at", "status", "error_message", "campaign_row", "created_at"),
+    "campaigns": ("campaign_id", "text_prompt", "character_limit", "campaign_type", "filter_last_visit_days", "filter_last_sms_days", "rank", "process_date", "process_status", "channels", "email_subject", "email_html", "active", "created_at", "updated_at"),
     "sync_log": ("log_id", "sync_date", "source", "records_fetched", "records_inserted", "records_updated", "records_deactivated", "errors", "duration_sec"),
     "webhook_events": ("event_id", "event_type", "action", "event_created_at", "payload_json", "received_at", "processed_at", "process_status", "error_message"),
 }
@@ -49,7 +49,7 @@ INTEGER_COLUMNS: dict[str, frozenset[str]] = {
     "employees": frozenset({"employee_id", "active"}),
     "transactions": frozenset({"transaction_id", "customer_id"}),
     "sms_history": frozenset({"sms_id", "customer_id", "campaign_row"}),
-    "email_history": frozenset({"email_id", "customer_id"}),
+    "email_history": frozenset({"email_id", "customer_id", "campaign_row"}),
     "campaigns": frozenset({"campaign_id", "character_limit", "filter_last_visit_days", "filter_last_sms_days", "rank", "active"}),
     "sync_log": frozenset({"log_id", "records_fetched", "records_inserted", "records_updated", "records_deactivated"}),
 }

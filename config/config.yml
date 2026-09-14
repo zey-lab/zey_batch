@@ -48,6 +48,9 @@ campaign_columns:
   rank: "Rank"
   process_date: "Campaign Process Date"
   process_status: "Campaign Process Status"
+  channels: "Channels"
+  email_subject: "Email Subject"
+  email_html: "Email HTML"
 
 # Campaign Types
 campaign_types:

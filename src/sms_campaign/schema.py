@@ -136,6 +136,7 @@ CREATE TABLE IF NOT EXISTS email_history (
     sent_at         TEXT DEFAULT (datetime('now')),
     status          TEXT,  -- sent, failed, delivered, opened
     error_message   TEXT,
+    campaign_row    INTEGER,
     created_at      TEXT DEFAULT (datetime('now'))
 );
 
@@ -150,6 +151,9 @@ CREATE TABLE IF NOT EXISTS campaigns (
     rank            INTEGER DEFAULT 999,
     process_date    TEXT,
     process_status  TEXT,
+    channels        TEXT DEFAULT 'sms',  -- sms, email, both, none
+    email_subject   TEXT,
+    email_html      TEXT,
     active          INTEGER DEFAULT 1,
     created_at      TEXT DEFAULT (datetime('now')),
     updated_at      TEXT DEFAULT (datetime('now'))
@@ -217,7 +221,7 @@ def migrate_database(db_path: Path) -> None:
     """Idempotently add any columns present in SCHEMA_SQL but missing from an existing DB."""
     conn = sqlite3.connect(str(db_path))
     try:
-        for table in ("customers", "services", "employees", "campaigns", "transactions"):
+        for table in ("customers", "services", "employees", "campaigns", "transactions", "email_history"):
             existing = {
                 row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
             }

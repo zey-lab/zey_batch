@@ -54,7 +54,7 @@ create table if not exists public.sms_history (
 create table if not exists public.email_history (
   email_id bigint primary key, customer_id bigint, campaign_type text,
   subject text, body text, sent_at text default now()::text, status text,
-  error_message text, created_at text default now()::text
+  error_message text, campaign_row integer, created_at text default now()::text
 );
 
 create table if not exists public.campaigns (
@@ -62,9 +62,16 @@ create table if not exists public.campaigns (
   character_limit integer default 160, campaign_type text default 'Campaign',
   filter_last_visit_days integer, filter_last_sms_days integer,
   rank integer default 999, process_date text, process_status text,
+  channels text default 'sms', email_subject text, email_html text,
   active integer default 1, created_at text default now()::text,
   updated_at text default now()::text
 );
+
+-- Safe additions for projects that already ran the first version of this file.
+alter table public.email_history add column if not exists campaign_row integer;
+alter table public.campaigns add column if not exists channels text default 'sms';
+alter table public.campaigns add column if not exists email_subject text;
+alter table public.campaigns add column if not exists email_html text;
 
 create table if not exists public.sync_log (
   log_id bigint primary key, sync_date text default now()::text, source text,
