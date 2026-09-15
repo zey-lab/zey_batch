@@ -306,9 +306,14 @@ class ZeyDataStore:
                         row.get("CustomerID", row.get("CustomerId", row.get("UserID")))
                     )
                     if vagaro_customer_id:
+                        # Webhook payloads send Vagaro's encrypted customer id
+                        # (matches enc_user_id); browser-scraped imports send
+                        # the plain numeric id (matches vagaro_user_id). Try
+                        # both so a customer already on file always resolves
+                        # regardless of which source this row came from.
                         cust = conn.execute(
-                            "SELECT customer_id FROM customers WHERE vagaro_user_id=?",
-                            (vagaro_customer_id,),
+                            "SELECT customer_id FROM customers WHERE vagaro_user_id=? OR enc_user_id=?",
+                            (vagaro_customer_id, vagaro_customer_id),
                         ).fetchone()
                         if cust:
                             customer_id = cust["customer_id"]
@@ -382,9 +387,14 @@ class ZeyDataStore:
                         row.get("CustomerID", row.get("CustomerId", row.get("UserID")))
                     )
                     if vagaro_customer_id:
+                        # Webhook payloads send Vagaro's encrypted customer id
+                        # (matches enc_user_id); browser-scraped imports send
+                        # the plain numeric id (matches vagaro_user_id). Try
+                        # both so a customer already on file always resolves
+                        # regardless of which source this row came from.
                         cust = conn.execute(
-                            "SELECT customer_id FROM customers WHERE vagaro_user_id=?",
-                            (vagaro_customer_id,),
+                            "SELECT customer_id FROM customers WHERE vagaro_user_id=? OR enc_user_id=?",
+                            (vagaro_customer_id, vagaro_customer_id),
                         ).fetchone()
                         if cust:
                             customer_id = cust["customer_id"]
