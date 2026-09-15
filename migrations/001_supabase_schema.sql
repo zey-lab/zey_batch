@@ -107,3 +107,27 @@ alter table public.campaigns add column if not exists test_recipients text;
 -- Employee name resolution fix (2026-09-15): webhooks send Vagaro's
 -- encrypted staff id, which had no matching column before.
 alter table public.employees add column if not exists enc_emp_id text;
+
+-- Auto-touch updated_at on every UPDATE (2026-09-15): without this, a
+-- manual edit in the Table Editor leaves updated_at unchanged, and
+-- pull_from_supabase.py's last-write-wins comparison then incorrectly
+-- treats the fresh edit as stale and skips it.
+create or replace function public.touch_updated_at()
+returns trigger as $$
+begin
+  new.updated_at = now()::text;
+  return new;
+end;
+$$ language plpgsql;
+
+do $$
+declare t text;
+begin
+  foreach t in array array['customers','campaigns','employees'] loop
+    execute format('drop trigger if exists trg_touch_updated_at on public.%I', t);
+    execute format(
+      'create trigger trg_touch_updated_at before update on public.%I
+       for each row execute function public.touch_updated_at()', t
+    );
+  end loop;
+end $$;
