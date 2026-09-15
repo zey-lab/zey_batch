@@ -321,7 +321,9 @@ class ZeyDataStore:
                 vagaro_appt_id = str(row.get("AppointmentID", row.get("ID", "")))
                 data = {
                     "customer_id": customer_id,
-                    "employee_name": self._str(row.get("Employee", row.get("Staff"))),
+                    "employee_name": self._resolve_employee_name(
+                        conn, row.get("Employee", row.get("Staff"))
+                    ),
                     "service_name": self._str(row.get("Service", row.get("ServiceName"))),
                     "service_date": self._str(row.get("Date", row.get("AppointmentDate"))),
                     "duration_min": self._int(row.get("Duration")),
@@ -412,8 +414,9 @@ class ZeyDataStore:
                     "vagaro_transaction_id": vagaro_transaction_id,
                     "customer_id": customer_id,
                     "customer_name": self._str(row.get("CustomerName", row.get("Customer"))),
-                    "employee_name": self._str(
-                        row.get("Employee", row.get("Staff", row.get("ServiceProviderName", row.get("CheckedOutBy"))))
+                    "employee_name": self._resolve_employee_name(
+                        conn,
+                        row.get("Employee", row.get("Staff", row.get("ServiceProviderName", row.get("CheckedOutBy")))),
                     ),
                     "transaction_date": self._str(row.get("TransactionDate", row.get("Date"))),
                     "transaction_type": self._str(row.get("TransactionType", row.get("Type", row.get("TranType")))),
@@ -813,6 +816,33 @@ class ZeyDataStore:
             else:
                 clean = f"+{clean}"
         return clean
+
+    def _resolve_employee_name(self, conn, raw_value) -> Optional[str]:
+        """Resolve a webhook/import employee reference to a real name.
+
+        Webhook payloads send Vagaro's encrypted staff id (matches
+        enc_emp_id); browser-scraped imports already send a plain name or
+        the plain numeric id (matches vagaro_emp_id). If neither column
+        matches, the raw value is kept as-is so nothing is silently lost.
+        """
+        value = self._str(raw_value)
+        if not value:
+            return None
+        row = conn.execute(
+            "SELECT name FROM employees WHERE vagaro_emp_id=? OR enc_emp_id=?",
+            (value, value),
+        ).fetchone()
+        if row:
+            return row["name"]
+        # Solo-practice shortcut: Zey Brow & Wax has exactly one active
+        # staff member as of 2026-09-15. Vagaro sends more than one
+        # distinct encrypted id for the same person across event types, so
+        # an unmatched id is still safely them rather than an unknown
+        # employee -- as long as there truly is only one on file.
+        solo = conn.execute("SELECT name FROM employees WHERE active=1").fetchall()
+        if len(solo) == 1:
+            return solo[0]["name"]
+        return value
 
     @staticmethod
     def _str(val) -> Optional[str]:

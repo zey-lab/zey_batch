@@ -103,3 +103,7 @@ end $$;
 -- filtering entirely.
 alter table public.campaigns add column if not exists approved integer default 0;
 alter table public.campaigns add column if not exists test_recipients text;
+
+-- Employee name resolution fix (2026-09-15): webhooks send Vagaro's
+-- encrypted staff id, which had no matching column before.
+alter table public.employees add column if not exists enc_emp_id text;

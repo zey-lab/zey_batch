@@ -102,6 +102,7 @@ CREATE TABLE IF NOT EXISTS transactions (
 CREATE TABLE IF NOT EXISTS employees (
     employee_id     INTEGER PRIMARY KEY AUTOINCREMENT,
     vagaro_emp_id   TEXT UNIQUE,
+    enc_emp_id      TEXT UNIQUE,  -- Vagaro's encrypted staff id, as sent by webhooks
     name            TEXT NOT NULL,
     role            TEXT,
     phone           TEXT,
