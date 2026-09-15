@@ -72,7 +72,7 @@ class WebhookProcessor:
             return {"status": "duplicate", "event_id": event_id}
 
         try:
-            derived = self._ingest(event_type, payload)
+            derived = self._ingest(event_type, payload, self._text(event.get("action")))
             self._mark(event_id, "processed", None)
         except Exception as exc:  # retain receipt when a mapping needs repair
             self._mark(event_id, "error", str(exc))
@@ -102,7 +102,7 @@ class WebhookProcessor:
         if not hmac.compare_digest(supplied, self.verification_token):
             raise WebhookError("Invalid webhook verification token")
 
-    def _ingest(self, event_type: str, payload: dict) -> dict[str, object]:
+    def _ingest(self, event_type: str, payload: dict, action: str = "") -> dict[str, object]:
         if event_type == "transaction":
             # Vagaro transaction webhooks are compact and do not reliably
             # include customer/staff names or the complete report fields.
@@ -159,9 +159,13 @@ class WebhookProcessor:
             result = self.store.sync_employees(pd.DataFrame([row]))
             return {"derived_table": "employees", "inserted": result.inserted, "updated": result.updated}
 
-        # A customer webhook is retained verbatim and reconciled by the daily
-        # customer snapshot. A one-row event must not deactivate other customers.
-        return {"derived_table": "webhook_events", "customer_sync": "deferred_to_snapshot"}
+        if event_type == "customer":
+            # Scoped to exactly this one customer_id -- cannot affect any
+            # other row, unlike the bulk report import this replaces.
+            result = self.store.sync_customer_from_webhook(payload, action)
+            return {"derived_table": "customers", **result}
+
+        return {"derived_table": "webhook_events", "status": "unsupported_event_type"}
 
     @classmethod
     def _has_complete_transaction(cls, payload: dict) -> bool:

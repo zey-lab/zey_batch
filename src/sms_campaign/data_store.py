@@ -39,6 +39,80 @@ class ZeyDataStore:
 
     # ── Customers ──────────────────────────────────────────────
 
+    def sync_customer_from_webhook(self, payload: dict, action: str) -> dict:
+        """Apply a single Vagaro customer webhook event safely.
+
+        Scoped to exactly the one customer_id the event names -- this can
+        never touch any other row, unlike the bulk report import. Never
+        writes sms_opt_out/email_opt_out/active on create or update: those
+        stay under the business owner's explicit control (Supabase/manual).
+        A 'deleted' action deactivates only this one customer.
+        """
+        enc_id = self._str(payload.get("customerId"))
+        if not enc_id:
+            return {"status": "skipped", "reason": "missing customerId"}
+
+        conn = self._conn()
+        try:
+            existing = conn.execute(
+                "SELECT customer_id FROM customers WHERE enc_user_id=?", (enc_id,)
+            ).fetchone()
+
+            if action == "deleted":
+                if not existing:
+                    return {"status": "skipped", "reason": "unknown customer"}
+                conn.execute(
+                    "UPDATE customers SET active=0, updated_at=datetime('now') WHERE customer_id=?",
+                    (existing["customer_id"],),
+                )
+                conn.commit()
+                return {"status": "deactivated", "customer_id": existing["customer_id"]}
+
+            fields = {
+                "first_name": self._str(payload.get("customerFirstName")),
+                "last_name": self._str(payload.get("customerLastName")),
+                "email": self._str(payload.get("email")),
+                "address": self._str(payload.get("streetAddress")),
+                "city": self._str(payload.get("city")),
+                "state": self._str(payload.get("regionCode")),
+                "zip": self._str(payload.get("postalCode")),
+            }
+            mobile = self._normalize_phone(
+                payload.get("mobilePhone") or payload.get("dayPhone") or payload.get("nightPhone")
+            )
+
+            if existing:
+                # Only overwrite columns the webhook actually supplied a
+                # value for -- a blank field in the payload must not erase
+                # data that a fuller import already captured.
+                set_fields = {k: v for k, v in fields.items() if v is not None}
+                if mobile:
+                    set_fields["mobile"] = mobile
+                if not set_fields:
+                    return {"status": "noop", "customer_id": existing["customer_id"]}
+                set_fields["customer_id"] = existing["customer_id"]
+                assignments = ", ".join(f"{k}=:{k}" for k in set_fields if k != "customer_id")
+                conn.execute(
+                    f"UPDATE customers SET {assignments}, updated_at=datetime('now') WHERE customer_id=:customer_id",
+                    set_fields,
+                )
+                conn.commit()
+                return {"status": "updated", "customer_id": existing["customer_id"]}
+
+            if not mobile:
+                return {"status": "skipped", "reason": "no phone number available"}
+            fields["enc_user_id"] = enc_id
+            fields["mobile"] = mobile
+            cols = ", ".join(fields.keys())
+            placeholders = ", ".join(f":{k}" for k in fields.keys())
+            cur = conn.execute(
+                f"INSERT INTO customers ({cols}) VALUES ({placeholders})", fields
+            )
+            conn.commit()
+            return {"status": "created", "customer_id": cur.lastrowid}
+        finally:
+            conn.close()
+
     def sync_customers(self, df: pd.DataFrame) -> SyncResult:
         """Sync Vagaro customer report into the customers table."""
         if df.empty:

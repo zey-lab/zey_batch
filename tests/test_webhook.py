@@ -84,21 +84,79 @@ class TestWebhookProcessor(unittest.TestCase):
             with self.assertRaisesRegex(WebhookError, "Invalid"):
                 processor.process({"X-Vagaro-Verification-Token": "wrong"}, b"{}")
 
-    def test_customer_event_is_retained_for_snapshot_reconciliation(self) -> None:
+    def test_customer_created_webhook_inserts_a_new_customer(self) -> None:
         with TemporaryDirectory() as temp_dir:
-            processor = WebhookProcessor(Path(temp_dir) / "zey.sqlite3", "secret")
+            db_path = Path(temp_dir) / "zey.sqlite3"
+            processor = WebhookProcessor(db_path, "secret")
             result = processor.process(
                 {"Authorization": "Bearer secret"},
-                json.dumps(
-                    {
-                        "id": "event-customer",
-                        "type": "customer",
-                        "action": "updated",
-                        "payload": {"customerId": "cust-1", "mobilePhone": "5550000001"},
-                    }
-                ).encode(),
+                json.dumps({
+                    "id": "event-customer-new", "type": "customer", "action": "created",
+                    "payload": {
+                        "customerId": "enc-new-1", "customerFirstName": "Nina",
+                        "customerLastName": "Diaz", "mobilePhone": "5550009999",
+                        "email": "nina@example.com",
+                    },
+                }).encode(),
             )
-            self.assertEqual(result["customer_sync"], "deferred_to_snapshot")
+            self.assertEqual(result["derived_table"], "customers")
+            self.assertEqual(result["status"], "created")
+            import sqlite3
+            conn = sqlite3.connect(str(db_path))
+            saved = conn.execute(
+                "SELECT first_name, mobile, sms_opt_out FROM customers WHERE enc_user_id='enc-new-1'"
+            ).fetchone()
+            self.assertEqual(saved[0], "Nina")
+            self.assertEqual(saved[2], 0)  # opted in by default, matching the bulk import
+
+    def test_customer_updated_webhook_never_touches_opt_out(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "zey.sqlite3"
+            processor = WebhookProcessor(db_path, "secret")
+            processor.store.sync_customers(pd.DataFrame([
+                {"UserID": "cust-1", "encUserId": "enc-1", "Mobile": "5550000001", "FirstName": "Old"}
+            ]))
+            processor.store.set_opt_out("+15550000001")
+
+            result = processor.process(
+                {"Authorization": "Bearer secret"},
+                json.dumps({
+                    "id": "event-customer-upd", "type": "customer", "action": "updated",
+                    "payload": {"customerId": "enc-1", "customerFirstName": "New", "city": "Dallas"},
+                }).encode(),
+            )
+            self.assertEqual(result["status"], "updated")
+            import sqlite3
+            conn = sqlite3.connect(str(db_path))
+            saved = conn.execute(
+                "SELECT first_name, city, sms_opt_out FROM customers WHERE enc_user_id='enc-1'"
+            ).fetchone()
+            self.assertEqual(saved[0], "New")
+            self.assertEqual(saved[1], "Dallas")
+            self.assertEqual(saved[2], 1)  # opt-out survives the webhook update untouched
+
+    def test_customer_deleted_webhook_deactivates_only_that_customer(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "zey.sqlite3"
+            processor = WebhookProcessor(db_path, "secret")
+            processor.store.sync_customers(pd.DataFrame([
+                {"UserID": "cust-1", "encUserId": "enc-1", "Mobile": "5550000001"},
+                {"UserID": "cust-2", "encUserId": "enc-2", "Mobile": "5550000002"},
+            ]))
+
+            result = processor.process(
+                {"Authorization": "Bearer secret"},
+                json.dumps({
+                    "id": "event-customer-del", "type": "customer", "action": "deleted",
+                    "payload": {"customerId": "enc-1"},
+                }).encode(),
+            )
+            self.assertEqual(result["status"], "deactivated")
+            import sqlite3
+            conn = sqlite3.connect(str(db_path))
+            rows = dict(conn.execute("SELECT enc_user_id, active FROM customers").fetchall())
+            self.assertEqual(rows["enc-1"], 0)
+            self.assertEqual(rows["enc-2"], 1)  # the other customer is untouched
 
 
 if __name__ == "__main__":
