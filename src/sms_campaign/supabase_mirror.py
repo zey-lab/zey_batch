@@ -34,11 +34,11 @@ TABLES: tuple[tuple[str, str], ...] = (
 TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
     "customers": ("customer_id", "vagaro_user_id", "mobile", "first_name", "last_name", "email", "birthdate", "gender", "address", "city", "state", "zip", "apt_suite", "customer_since", "last_visit", "membership", "referred_by", "online_booking", "tags", "communication_preference", "sms_opt_out", "opt_out_date", "email_opt_out", "active", "acquisition", "bank_name_number", "cdn_url", "country_id", "custom_fields_groups", "day_phone", "email_failed_reason", "email_format", "general_tag", "is_valid_email", "is_valid_text", "night_phone", "no_of_booking", "no_of_class_booked", "no_of_class_check_ins", "no_show_cancel", "photo", "service_providers", "street_address", "street_no", "text_failed_reason", "total_amount_paid", "total_points_accumulated", "ucc_no", "ucc_type", "enc_user_id", "raw_json", "created_at", "updated_at"),
     "services": ("service_id", "customer_id", "employee_name", "service_name", "service_date", "duration_min", "amount_paid", "notes", "vagaro_appt_id", "created_at"),
-    "employees": ("employee_id", "vagaro_emp_id", "name", "role", "phone", "email", "active", "schedule_json", "created_at", "updated_at"),
+    "employees": ("employee_id", "vagaro_emp_id", "enc_emp_id", "name", "role", "phone", "email", "active", "schedule_json", "created_at", "updated_at"),
     "transactions": ("transaction_id", "vagaro_transaction_id", "customer_id", "customer_name", "employee_name", "transaction_date", "transaction_type", "payment_method", "subtotal", "tax", "tip", "discount", "total_amount", "status", "notes", "raw_json", "created_at"),
     "sms_history": ("sms_id", "customer_id", "campaign_type", "message_text", "sent_at", "status", "twilio_sid", "error_message", "campaign_row", "created_at"),
     "email_history": ("email_id", "customer_id", "campaign_type", "subject", "body", "sent_at", "status", "error_message", "campaign_row", "created_at"),
-    "campaigns": ("campaign_id", "text_prompt", "character_limit", "campaign_type", "filter_last_visit_days", "filter_last_sms_days", "rank", "process_date", "process_status", "channels", "email_subject", "email_html", "active", "created_at", "updated_at"),
+    "campaigns": ("campaign_id", "text_prompt", "character_limit", "campaign_type", "filter_last_visit_days", "filter_last_sms_days", "rank", "process_date", "process_status", "channels", "email_subject", "email_html", "approved", "test_recipients", "active", "created_at", "updated_at"),
     "sync_log": ("log_id", "sync_date", "source", "records_fetched", "records_inserted", "records_updated", "records_deactivated", "errors", "duration_sec"),
     "webhook_events": ("event_id", "event_type", "action", "event_created_at", "payload_json", "received_at", "processed_at", "process_status", "error_message"),
 }
@@ -50,7 +50,7 @@ INTEGER_COLUMNS: dict[str, frozenset[str]] = {
     "transactions": frozenset({"transaction_id", "customer_id"}),
     "sms_history": frozenset({"sms_id", "customer_id", "campaign_row"}),
     "email_history": frozenset({"email_id", "customer_id", "campaign_row"}),
-    "campaigns": frozenset({"campaign_id", "character_limit", "filter_last_visit_days", "filter_last_sms_days", "rank", "active"}),
+    "campaigns": frozenset({"campaign_id", "character_limit", "filter_last_visit_days", "filter_last_sms_days", "rank", "active", "approved"}),
     "sync_log": frozenset({"log_id", "records_fetched", "records_inserted", "records_updated", "records_deactivated"}),
 }
 
