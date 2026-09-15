@@ -8,6 +8,7 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Mapping
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -115,7 +116,7 @@ class WebhookProcessor:
 
             row = {
                 "ID": payload.get("transactionId"),
-                "TransactionDate": payload.get("transactionDate"),
+                "TransactionDate": self._fix_mislabeled_central_timestamp(payload.get("transactionDate")),
                 "TransactionType": payload.get("purchaseType"),
                 "PaymentMethod": payload.get("ccType") or payload.get("paymentMethod"),
                 "SubTotal": payload.get("subtotal"),
@@ -176,6 +177,24 @@ class WebhookProcessor:
         """
         required_text = ("transactionId", "transactionDate", "customerId", "itemSold")
         return all(cls._text(payload.get(key)) for key in required_text)
+
+    @staticmethod
+    def _fix_mislabeled_central_timestamp(value: object) -> str | None:
+        """Vagaro's transactionDate carries a 'Z' (UTC) suffix but the
+        value is actually America/Chicago local time (confirmed 2026-09-15:
+        every transactionDate sits exactly 5h -- the CDT offset -- behind
+        the webhook's own createdDate, which IS genuine UTC). Re-interpret
+        as Chicago local time and convert properly so it lines up with
+        received_at/created_at, and so the correction stays right across
+        DST transitions instead of a hardcoded -5h."""
+        if not value:
+            return None
+        try:
+            naive = datetime.fromisoformat(str(value).replace("Z", ""))
+        except ValueError:
+            return str(value)
+        local = naive.replace(tzinfo=ZoneInfo("America/Chicago"))
+        return local.astimezone(timezone.utc).isoformat()
 
     @staticmethod
     def _payment_total(payload: dict) -> float | None:
