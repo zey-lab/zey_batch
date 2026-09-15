@@ -122,7 +122,7 @@ class WebhookProcessor:
                 "Tax": payload.get("tax"),
                 "Tip": payload.get("tip"),
                 "Discount": payload.get("discount"),
-                "Total": payload.get("totalAmount", payload.get("amountPaid")),
+                "Total": payload.get("totalAmount", payload.get("amountPaid", self._payment_total(payload))),
                 "CustomerID": payload.get("customerId"),
                 "Employee": payload.get("serviceProviderId"),
                 "CustomerName": payload.get("customerName"),
@@ -139,6 +139,7 @@ class WebhookProcessor:
                 "Service": payload.get("serviceTitle"),
                 "Date": payload.get("startTime"),
                 "Amount": payload.get("amount"),
+                "Duration": self._minutes_between(payload.get("startTime"), payload.get("endTime")),
             }
             result = self.store.sync_services(pd.DataFrame([row]))
             return {"derived_table": "services", "inserted": result.inserted, "updated": result.updated}
@@ -163,17 +164,32 @@ class WebhookProcessor:
 
     @classmethod
     def _has_complete_transaction(cls, payload: dict) -> bool:
-        """Return whether a webhook has enough detail for the canonical table."""
-        required_text = (
-            "transactionId",
-            "transactionDate",
-            "customerId",
-            "customerName",
-            "itemSold",
+        """Return whether a webhook has enough detail for the canonical table.
+
+        Vagaro's real transaction webhook never includes customerName or a
+        single totalAmount/amountPaid field -- it sends itemized payment
+        components instead (ccAmount, cashAmount, etc.). Requiring those
+        two fields silently deferred every single real transaction webhook
+        forever (found 2026-09-15: 103/103 received, 0 ever reached the
+        transactions table). customerName is dropped from the requirement;
+        the total is computed from the itemized components instead.
+        """
+        required_text = ("transactionId", "transactionDate", "customerId", "itemSold")
+        return all(cls._text(payload.get(key)) for key in required_text)
+
+    @staticmethod
+    def _payment_total(payload: dict) -> float | None:
+        """Sum Vagaro's itemized payment-method fields into one total
+        (excludes tip, which the schema tracks as its own column)."""
+        components = (
+            "ccAmount", "cashAmount", "checkAmount", "achAmount",
+            "bankAccountAmount", "vagaroPayLaterAmount", "otherAmount",
+            "packageRedemption", "gcRedemption", "memberShipAmount",
         )
-        if not all(cls._text(payload.get(key)) for key in required_text):
-            return False
-        return payload.get("totalAmount") is not None or payload.get("amountPaid") is not None
+        values = [payload.get(key) for key in components if payload.get(key) is not None]
+        if not values:
+            return None
+        return sum(float(v) for v in values)
 
     def _mark(self, event_id: str, status: str, error: str | None) -> None:
         conn = sqlite3.connect(str(self.db_path))
@@ -195,6 +211,17 @@ class WebhookProcessor:
             if str(name).lower() == wanted:
                 return str(value).strip()
         return ""
+
+    @staticmethod
+    def _minutes_between(start: object, end: object) -> int | None:
+        if not start or not end:
+            return None
+        try:
+            start_dt = datetime.fromisoformat(str(start).replace("Z", "+00:00"))
+            end_dt = datetime.fromisoformat(str(end).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return round((end_dt - start_dt).total_seconds() / 60)
 
     @staticmethod
     def _text(value: object) -> str:

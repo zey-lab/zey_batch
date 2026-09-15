@@ -12,7 +12,13 @@ from sms_campaign.webhook import WebhookError, WebhookProcessor
 
 
 class TestWebhookProcessor(unittest.TestCase):
-    def test_partial_transaction_is_retained_without_polluting_canonical_table(self) -> None:
+    def test_real_shape_transaction_webhook_is_ingested_not_deferred(self) -> None:
+        """Regression test for the 2026-09-15 incident: Vagaro's real
+        transaction webhook never sends customerName or a single
+        totalAmount/amountPaid field (only itemized payment components like
+        ccAmount/cashAmount). The old completeness check required both,
+        which silently deferred every single real transaction webhook
+        forever -- 103 received, 0 ever reached the transactions table."""
         with TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "zey.sqlite3"
             processor = WebhookProcessor(db_path, "secret")
@@ -32,7 +38,8 @@ class TestWebhookProcessor(unittest.TestCase):
                     "customerId": "cust-1",
                     "tax": 1.0,
                     "tip": 5.0,
-                    "amountPaid": 26.0,
+                    "ccAmount": 25.0,
+                    "cashAmount": 0,
                 },
             }
             body = json.dumps(event).encode()
@@ -40,8 +47,31 @@ class TestWebhookProcessor(unittest.TestCase):
             second = processor.process({"X-Vagaro-Verification-Token": "secret"}, body)
 
             self.assertEqual(first["status"], "accepted")
-            self.assertEqual(first["transaction_sync"], "deferred_to_complete_snapshot")
+            self.assertEqual(first["derived_table"], "transactions")
             self.assertEqual(second, {"status": "duplicate", "event_id": "event-1"})
+
+    def test_genuinely_incomplete_transaction_is_still_deferred(self) -> None:
+        """A transaction webhook missing a truly required field (itemSold)
+        must still defer to the canonical-table snapshot, not be guessed."""
+        with TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "zey.sqlite3"
+            processor = WebhookProcessor(db_path, "secret")
+            event = {
+                "id": "event-2",
+                "createdDate": "2026-09-06T19:00:00Z",
+                "type": "transaction",
+                "action": "created",
+                "payload": {
+                    "transactionId": "txn-2",
+                    "transactionDate": "2026-09-06T18:59:00Z",
+                    "customerId": "cust-1",
+                },
+            }
+            body = json.dumps(event).encode()
+            result = processor.process({"X-Vagaro-Verification-Token": "secret"}, body)
+
+            self.assertEqual(result["status"], "accepted")
+            self.assertEqual(result["transaction_sync"], "deferred_to_complete_snapshot")
 
             conn = sqlite3.connect(db_path)
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM webhook_events").fetchone()[0], 1)
