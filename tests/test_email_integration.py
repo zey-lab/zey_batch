@@ -42,6 +42,7 @@ class TestEmailIntegration(unittest.TestCase):
       store.import_campaigns_from_dataframe(pd.DataFrame([{
         "Text/Prompt": "Hi {first_name}, we miss you!", "Type (Campaing / Reminder)": "Campaign",
         "Filter-Last Visit Days": 1, "Channels": "email", "Email Subject": "Hello {first_name}",
+        "Approved": 1,
       }]))
       sender = EmailSender(EmailConfig(sender="zeybrowwax@gmail.com"), dry_run=True)
       runner = EmailCampaignRunner(store, sender, test_emails=["ana@example.com"])

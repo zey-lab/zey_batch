@@ -637,6 +637,8 @@ class ZeyDataStore:
                     "channels": self._str(row.get("Channels", row.get("Channel", "sms"))) or "sms",
                     "email_subject": self._str(row.get("Email Subject")),
                     "email_html": self._str(row.get("Email HTML")),
+                    "approved": self._int(row.get("Approved", 0)) or 0,
+                    "test_recipients": self._str(row.get("Test Recipients")),
                 }
 
                 # Check if similar campaign exists (by text_prompt + type)
@@ -655,6 +657,7 @@ class ZeyDataStore:
                             process_status=:process_status,
                             channels=:channels, email_subject=:email_subject,
                             email_html=:email_html,
+                            approved=:approved, test_recipients=:test_recipients,
                             updated_at=datetime('now')
                         WHERE campaign_id=:campaign_id""",
                         {**data, "campaign_id": existing["campaign_id"]},
@@ -666,12 +669,14 @@ class ZeyDataStore:
                             (text_prompt, character_limit, campaign_type,
                              filter_last_visit_days, filter_last_sms_days,
                              rank, process_date, process_status,
-                             channels, email_subject, email_html)
+                             channels, email_subject, email_html,
+                             approved, test_recipients)
                         VALUES
                             (:text_prompt, :character_limit, :campaign_type,
                              :filter_last_visit_days, :filter_last_sms_days,
                             :rank, :process_date, :process_status,
-                            :channels, :email_subject, :email_html)""",
+                            :channels, :email_subject, :email_html,
+                            :approved, :test_recipients)""",
                         data,
                     )
                     result.inserted += 1

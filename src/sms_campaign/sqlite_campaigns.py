@@ -131,7 +131,17 @@ class SQLiteCampaignRunner:
         """Evaluate and optionally send one SMS campaign."""
         customers = self.load_customers()
         eligible = self.processor.filter_customers_for_campaign(customers, campaign)
-        if self.test_phones:
+        if campaign.test_recipients:
+            # Per-campaign override (set via Supabase/sheet): restricts this
+            # run to ONLY these numbers, bypassing normal customer filtering
+            # entirely. Takes priority over the CLI --test-phone flag.
+            recipients = {
+                self.store._normalize_phone(value)
+                for value in campaign.test_recipients.replace(";", ",").split(",")
+                if value.strip()
+            }
+            eligible = eligible[eligible["mobile"].isin(recipients)]
+        elif self.test_phones:
             eligible = eligible[eligible["mobile"].isin(self.test_phones)]
 
         previews = tuple(
@@ -236,7 +246,17 @@ class EmailCampaignRunner:
     def run_campaign(self, campaign: Campaign, *, campaign_id: int, preview_limit: int = 5) -> CampaignRunResult:
         customers = self.load_customers()
         eligible = self.processor.filter_customers_for_campaign(customers, campaign)
-        if self.test_emails:
+        if campaign.test_recipients:
+            # Per-campaign override (set via Supabase/sheet): restricts this
+            # run to ONLY these addresses, bypassing normal customer
+            # filtering entirely. Takes priority over --test-email.
+            recipients = {
+                value.strip().lower()
+                for value in campaign.test_recipients.replace(";", ",").split(",")
+                if value.strip()
+            }
+            eligible = eligible[eligible["email"].astype(str).str.lower().isin(recipients)]
+        elif self.test_emails:
             eligible = eligible[eligible["email"].astype(str).str.lower().isin(self.test_emails)]
         previews: list[dict[str, Any]] = []
         for _, row in eligible.head(preview_limit).iterrows():

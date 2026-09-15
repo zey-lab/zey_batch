@@ -28,6 +28,7 @@ class TestSQLiteCampaignRunner(unittest.TestCase):
                 "Filter-Last Visit Days": 30,
                 "Filter-Last SMS Day": 15,
                 "Rank": 1,
+                "Approved": 1,
             }
         ]))
         return store
@@ -59,6 +60,49 @@ class TestSQLiteCampaignRunner(unittest.TestCase):
             self.assertEqual(result.sent_count, 1)
             self.assertEqual(history.iloc[0]["twilio_sid"], "SM-123")
             self.assertEqual(history.iloc[0]["status"], "delivered")
+
+    def test_unapproved_campaign_is_never_pending_regardless_of_type(self) -> None:
+        """Regression test for the 2026-09-14 incident: a non-Announce
+        campaign (type=Campaign) with approved=0 must never be eligible,
+        even though older logic treated non-Announce types as always
+        pending."""
+        with TemporaryDirectory() as temp_dir:
+            store = ZeyDataStore(Path(temp_dir) / "zey.sqlite3")
+            store.sync_customers(pd.DataFrame([
+                {"UserID": "V-1", "Mobile": "5550000001", "FirstName": "Ana", "LastVisited": "2020-01-01"},
+            ]))
+            store.import_campaigns_from_dataframe(pd.DataFrame([
+                {
+                    "Text/Prompt": "Miss you!", "Type (Campaing / Reminder)": "Campaign",
+                    "Filter-Last Visit Days": 1, "Filter-Last SMS Day": 1,
+                    # Approved intentionally omitted -> must default to 0/not-pending.
+                }
+            ]))
+            sender = SMSSender("", "", "", dry_run=True)
+            runner = SQLiteCampaignRunner(store, sender)
+            self.assertEqual(runner.pending_campaigns(), [])
+
+    def test_test_recipients_restricts_run_to_only_those_numbers(self) -> None:
+        """A campaign-level test_recipients value must override normal
+        customer filtering and send to ONLY the listed numbers."""
+        with TemporaryDirectory() as temp_dir:
+            store = ZeyDataStore(Path(temp_dir) / "zey.sqlite3")
+            store.sync_customers(pd.DataFrame([
+                {"UserID": "V-1", "Mobile": "5550000001", "FirstName": "Ana", "LastVisited": "2020-01-01"},
+                {"UserID": "V-2", "Mobile": "5550000002", "FirstName": "Bo", "LastVisited": "2020-01-01"},
+            ]))
+            store.import_campaigns_from_dataframe(pd.DataFrame([
+                {
+                    "Text/Prompt": "Miss you!", "Type (Campaing / Reminder)": "Campaign",
+                    "Filter-Last Visit Days": 1, "Filter-Last SMS Day": 1,
+                    "Approved": 1, "Test Recipients": "5550000001",
+                }
+            ]))
+            sender = SMSSender("", "", "", dry_run=True)
+            runner = SQLiteCampaignRunner(store, sender)
+            result = runner.run_campaign(runner.pending_campaigns()[0], campaign_id=1)
+            self.assertEqual(result.eligible_count, 1)
+            self.assertEqual(result.previews[0]["mobile"], "+15550000001")
 
 
 if __name__ == "__main__":

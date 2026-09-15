@@ -34,6 +34,8 @@ class Campaign:
         self.channels = str(self._get_field('channels', 'sms') or 'sms').strip().lower()
         self.email_subject = str(self._get_field('email_subject', '') or '')
         self.email_html = str(self._get_field('email_html', '') or '')
+        self.approved = bool(self._get_field('approved', 0))
+        self.test_recipients = str(self._get_field('test_recipients', '') or '').strip()
 
         # Parse numeric filters
         if self.rank is not None:
@@ -183,21 +185,27 @@ class CampaignProcessor:
         return campaigns
 
     def get_pending_campaigns(self, campaigns: List[Campaign]) -> List[Campaign]:
-        """Get campaigns that haven't been processed yet.
+        """Get campaigns that haven't been processed yet AND are approved.
 
-        Note: Only 'Announce' campaigns are filtered by processed status.
-        Other campaigns (Campaign, Reminder, etc.) are always considered pending
-        as they run continuously based on customer criteria.
+        Safety gate added 2026-09-15: no campaign of any type is eligible
+        unless explicitly approved=1 (set via Supabase/the campaign sheet).
+        This closes the prior gap where non-Announce campaigns (Campaign,
+        Reminder, etc.) were always considered pending regardless of review,
+        which caused an unintended live send to 205 real customers.
+
+        'Announce' campaigns are additionally excluded once already processed
+        (one-shot sends); other approved types run continuously based on
+        customer criteria, same as before.
 
         Args:
             campaigns: List of all campaigns
 
         Returns:
-            List of unprocessed campaigns
+            List of approved, unprocessed campaigns
         """
         return [
-            c for c in campaigns 
-            if not c.is_announce_campaign() or not c.is_processed()
+            c for c in campaigns
+            if c.approved and (not c.is_announce_campaign() or not c.is_processed())
         ]
 
     def filter_customers_for_campaign(

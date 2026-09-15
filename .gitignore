@@ -35,6 +35,9 @@ env/
 # Environment variables
 .env
 
+# Server-only OAuth and other secret material
+secrets/
+
 # Data files (excluding samples)
 data/*.xlsx
 data/*.csv

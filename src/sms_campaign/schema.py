@@ -154,6 +154,8 @@ CREATE TABLE IF NOT EXISTS campaigns (
     channels        TEXT DEFAULT 'sms',  -- sms, email, both, none
     email_subject   TEXT,
     email_html      TEXT,
+    approved        INTEGER DEFAULT 0,  -- must be 1 for ANY campaign type to be eligible to send
+    test_recipients TEXT,  -- comma-separated phone/email; when set, restricts the run to only these
     active          INTEGER DEFAULT 1,
     created_at      TEXT DEFAULT (datetime('now')),
     updated_at      TEXT DEFAULT (datetime('now'))

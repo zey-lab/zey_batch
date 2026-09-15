@@ -94,3 +94,12 @@ begin
     execute format('alter table public.%I enable row level security', table_name);
   end loop;
 end $$;
+
+-- Safety fields added after the 2026-09-14 accidental live-send incident.
+-- approved must be explicitly 1 for ANY campaign to be eligible to run,
+-- regardless of campaign_type (closes the 'Campaign type always pending'
+-- gap). test_recipients, when non-empty, restricts a run to ONLY those
+-- comma-separated phone numbers / emails, overriding normal customer
+-- filtering entirely.
+alter table public.campaigns add column if not exists approved integer default 0;
+alter table public.campaigns add column if not exists test_recipients text;
