@@ -5,11 +5,9 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from sms_campaign.sheet_mirror import CoalescingMirror
 from sms_campaign.webhook import WebhookError, WebhookProcessor
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -18,25 +16,6 @@ HOST = os.getenv("VAGARO_WEBHOOK_HOST", "127.0.0.1")
 PORT = int(os.getenv("VAGARO_WEBHOOK_PORT", "8787"))
 WEBHOOK_PATH = os.getenv("VAGARO_WEBHOOK_PATH", "/vagaro/webhook")
 MAX_BODY_BYTES = 1_048_576
-
-
-def mirror_google_sheets() -> None:
-    """Mirror the durable SQLite state using the configured gws credentials."""
-    result = subprocess.run(
-        ["uv", "run", "python", str(ROOT / "scripts" / "mirror_to_sheets.py")],
-        cwd=ROOT,
-        env={**os.environ, "GWS_HOME": os.getenv("GWS_HOME", "/opt/data")},
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=600,
-    )
-    if result.stdout.strip():
-        print(f"Google Sheets mirror: {result.stdout.strip()}")
-
-
-MIRROR_DELAY = float(os.getenv("WEBHOOK_MIRROR_DELAY_SECONDS", "30"))
-MIRROR_QUEUE = CoalescingMirror(mirror_google_sheets, MIRROR_DELAY)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -73,7 +52,6 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             self._send(500, {"error": "event processing failed"})
         else:
-            MIRROR_QUEUE.request()
             self._send(200, result)
 
     def log_message(self, format: str, *args: object) -> None:

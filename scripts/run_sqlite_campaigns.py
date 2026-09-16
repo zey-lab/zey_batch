@@ -13,7 +13,6 @@ import json
 import os
 from pathlib import Path
 
-from mirror_to_sheets import ensure_access_token, mirror_all
 from sms_campaign.data_store import ZeyDataStore
 from sms_campaign.services.sms_sender import SMSSender
 from sms_campaign.sqlite_campaigns import SQLiteCampaignRunner
@@ -28,7 +27,6 @@ def main() -> int:
     parser.add_argument("--test-phone", action="append", default=[], help="Restrict recipients")
     parser.add_argument("--max-messages", type=int, help="Cap messages in this run")
     parser.add_argument("--live", action="store_true", help="Actually send through Twilio")
-    parser.add_argument("--mirror", action="store_true", help="Mirror SQLite tables to Google Sheets after a live run")
     args = parser.parse_args()
 
     config = Config(env_file=root / ".env", config_file=root / "config" / "config.yml")
@@ -68,11 +66,6 @@ def main() -> int:
         for campaign in campaigns
     ]
     output: dict[str, object] = {"campaigns": [result.__dict__ for result in results]}
-    if args.mirror:
-        if not args.live:
-            parser.error("--mirror requires --live so the sheet contains only durable send results")
-        ensure_access_token()
-        output["mirror"] = mirror_all(runner.store)
     print(json.dumps(output, default=str, indent=2))
     return 0
 
