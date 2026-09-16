@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hmac
 import json
-import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Mapping
@@ -13,6 +12,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 from sms_campaign.data_store import ZeyDataStore
+from sms_campaign.db import get_connection
 
 SUPPORTED_TYPES = {"appointment", "customer", "employee", "transaction"}
 
@@ -50,12 +50,13 @@ class WebhookProcessor:
         if not isinstance(payload, dict):
             raise WebhookError("Webhook event is missing payload object")
 
-        conn = sqlite3.connect(str(self.db_path))
+        conn = get_connection()
         try:
             inserted = conn.execute(
-                """INSERT OR IGNORE INTO webhook_events
+                """INSERT INTO webhook_events
                    (event_id, event_type, action, event_created_at, payload_json)
-                   VALUES (?, ?, ?, ?, ?)""",
+                   VALUES (%s, %s, %s, %s, %s)
+                   ON CONFLICT (event_id) DO NOTHING""",
                 (
                     event_id,
                     event_type,
@@ -114,16 +115,35 @@ class WebhookProcessor:
                     "transaction_sync": "deferred_to_complete_snapshot",
                 }
 
+            total = payload.get("totalAmount", payload.get("amountPaid", self._payment_total(payload)))
+            tax = payload.get("tax") or 0
+            tip = payload.get("tip") or 0
+            discount = payload.get("discount") or 0
+            subtotal = payload.get("subtotal")
+            if subtotal is None and total is not None:
+                # Vagaro's real payload never sends subtotal directly, only
+                # the itemized payment total (which includes tip) plus tax/
+                # tip/discount as separate fields -- back it out the normal
+                # invoice way: total = subtotal + tax + tip - discount.
+                subtotal = total - tax - tip + discount
+
             row = {
-                "ID": payload.get("transactionId"),
+                # Vagaro's transactionId identifies the whole checkout and
+                # repeats across every line item when a checkout sells more
+                # than one service -- using it as our uniqueness key
+                # silently overwrote one line item with another (found
+                # 2026-09-16: 30/83 checkouts had 2+ line items, 40 earlier
+                # transactions lost this way). userPaymentId is unique per
+                # line item.
+                "ID": payload.get("userPaymentId") or payload.get("transactionId"),
                 "TransactionDate": self._fix_mislabeled_central_timestamp(payload.get("transactionDate")),
                 "TransactionType": payload.get("purchaseType"),
                 "PaymentMethod": payload.get("ccType") or payload.get("paymentMethod"),
-                "SubTotal": payload.get("subtotal"),
-                "Tax": payload.get("tax"),
-                "Tip": payload.get("tip"),
-                "Discount": payload.get("discount"),
-                "Total": payload.get("totalAmount", payload.get("amountPaid", self._payment_total(payload))),
+                "SubTotal": subtotal,
+                "Tax": tax,
+                "Tip": tip,
+                "Discount": discount,
+                "Total": total,
                 "CustomerID": payload.get("customerId"),
                 "Employee": payload.get("serviceProviderId"),
                 "CustomerName": payload.get("customerName"),
@@ -215,12 +235,12 @@ class WebhookProcessor:
         return sum(float(v) for v in values)
 
     def _mark(self, event_id: str, status: str, error: str | None) -> None:
-        conn = sqlite3.connect(str(self.db_path))
+        conn = get_connection()
         try:
             conn.execute(
                 """UPDATE webhook_events
-                   SET processed_at=?, process_status=?, error_message=?
-                   WHERE event_id=?""",
+                   SET processed_at=%s, process_status=%s, error_message=%s
+                   WHERE event_id=%s""",
                 (datetime.now(timezone.utc).isoformat(), status, error, event_id),
             )
             conn.commit()

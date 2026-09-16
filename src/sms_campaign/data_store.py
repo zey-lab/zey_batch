@@ -1,17 +1,21 @@
-"""Relational data store for Zey Brow customer ownership system."""
+"""Relational data store for Zey Brow customer ownership system.
+
+Backed entirely by Postgres/Supabase -- there is no local SQLite file. Every
+public method opens its own connection and commits/closes around its unit of
+work, mirroring the previous sqlite3-per-call pattern so callers didn't need
+to change.
+"""
 
 from __future__ import annotations
 
 import json
-import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path
 from typing import Optional
 
 import pandas as pd
 
-from sms_campaign.schema import init_database
+from sms_campaign.db import get_connection
 
 
 @dataclass
@@ -26,16 +30,23 @@ class SyncResult:
 class ZeyDataStore:
     """Unified data store for all Zey Brow business data."""
 
-    def __init__(self, db_path: Path):
+    def __init__(self, db_path=None):
+        # db_path is accepted only so older call sites (scripts, tests) that
+        # used to point at a SQLite file keep working unchanged. Supabase
+        # Postgres (DATABASE_URL) is now the only store; the value is
+        # otherwise unused.
         self.db_path = db_path
-        init_database(db_path)
 
-    def _conn(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(str(self.db_path))
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA foreign_keys=ON")
-        return conn
+    def _conn(self):
+        return get_connection()
+
+    @staticmethod
+    def _rows_to_df(cur) -> pd.DataFrame:
+        columns = [col.name for col in cur.description] if cur.description else []
+        rows = cur.fetchall()
+        if not rows:
+            return pd.DataFrame(columns=columns)
+        return pd.DataFrame(rows, columns=columns)
 
     # ── Customers ──────────────────────────────────────────────
 
@@ -55,14 +66,14 @@ class ZeyDataStore:
         conn = self._conn()
         try:
             existing = conn.execute(
-                "SELECT customer_id FROM customers WHERE enc_user_id=?", (enc_id,)
+                "SELECT customer_id FROM customers WHERE enc_user_id=%s", (enc_id,)
             ).fetchone()
 
             if action == "deleted":
                 if not existing:
                     return {"status": "skipped", "reason": "unknown customer"}
                 conn.execute(
-                    "UPDATE customers SET active=0, updated_at=datetime('now') WHERE customer_id=?",
+                    "UPDATE customers SET active=0, updated_at=now()::text WHERE customer_id=%s",
                     (existing["customer_id"],),
                 )
                 conn.commit()
@@ -91,9 +102,10 @@ class ZeyDataStore:
                 if not set_fields:
                     return {"status": "noop", "customer_id": existing["customer_id"]}
                 set_fields["customer_id"] = existing["customer_id"]
-                assignments = ", ".join(f"{k}=:{k}" for k in set_fields if k != "customer_id")
+                assignments = ", ".join(f"{k}=%({k})s" for k in set_fields if k != "customer_id")
                 conn.execute(
-                    f"UPDATE customers SET {assignments}, updated_at=datetime('now') WHERE customer_id=:customer_id",
+                    f"UPDATE customers SET {assignments}, updated_at=now()::text "
+                    f"WHERE customer_id=%(customer_id)s",
                     set_fields,
                 )
                 conn.commit()
@@ -104,12 +116,14 @@ class ZeyDataStore:
             fields["enc_user_id"] = enc_id
             fields["mobile"] = mobile
             cols = ", ".join(fields.keys())
-            placeholders = ", ".join(f":{k}" for k in fields.keys())
+            placeholders = ", ".join(f"%({k})s" for k in fields.keys())
             cur = conn.execute(
-                f"INSERT INTO customers ({cols}) VALUES ({placeholders})", fields
+                f"INSERT INTO customers ({cols}) VALUES ({placeholders}) RETURNING customer_id",
+                fields,
             )
+            new_id = cur.fetchone()["customer_id"]
             conn.commit()
-            return {"status": "created", "customer_id": cur.lastrowid}
+            return {"status": "created", "customer_id": new_id}
         finally:
             conn.close()
 
@@ -218,7 +232,7 @@ class ZeyDataStore:
 
                 # Check if this vagaro_user_id already exists (different mobile)
                 existing_by_vagaro = conn.execute(
-                    "SELECT customer_id, mobile FROM customers WHERE vagaro_user_id=? AND mobile!=?",
+                    "SELECT customer_id, mobile FROM customers WHERE vagaro_user_id=%s AND mobile!=%s",
                     (vagaro_id, mobile),
                 ).fetchone() if vagaro_id else None
 
@@ -226,7 +240,7 @@ class ZeyDataStore:
                     # Merge: keep the old mobile's record, update vagaro_id on the new one
                     # Delete the duplicate vagaro_id entry
                     conn.execute(
-                        "UPDATE customers SET vagaro_user_id=NULL WHERE customer_id=?",
+                        "UPDATE customers SET vagaro_user_id=NULL WHERE customer_id=%s",
                         (existing_by_vagaro["customer_id"],),
                     )
 
@@ -242,29 +256,29 @@ class ZeyDataStore:
 
                     conn.execute(
                         """UPDATE customers SET
-                            vagaro_user_id=:vagaro_user_id, first_name=:first_name,
-                            last_name=:last_name, email=:email, birthdate=:birthdate,
-                            gender=:gender, address=:address, city=:city, state=:state,
-                            zip=:zip, apt_suite=:apt_suite, customer_since=:customer_since,
-                            last_visit=:last_visit, membership=:membership,
-                            referred_by=:referred_by, online_booking=:online_booking,
-                            tags=:tags, sms_opt_out=:sms_opt_out, opt_out_date=:opt_out_date,
-                            email_opt_out=:email_opt_out, communication_preference=:communication_preference,
-                            active=:active, updated_at=:updated_at,
-                            acquisition=:acquisition, bank_name_number=:bank_name_number,
-                            cdn_url=:cdn_url, country_id=:country_id,
-                            custom_fields_groups=:custom_fields_groups, day_phone=:day_phone,
-                            email_failed_reason=:email_failed_reason, email_format=:email_format,
-                            general_tag=:general_tag, is_valid_email=:is_valid_email,
-                            is_valid_text=:is_valid_text, night_phone=:night_phone,
-                            no_of_booking=:no_of_booking, no_of_class_booked=:no_of_class_booked,
-                            no_of_class_check_ins=:no_of_class_check_ins, no_show_cancel=:no_show_cancel,
-                            photo=:photo, service_providers=:service_providers,
-                            street_address=:street_address, street_no=:street_no,
-                            text_failed_reason=:text_failed_reason, total_amount_paid=:total_amount_paid,
-                            total_points_accumulated=:total_points_accumulated, ucc_no=:ucc_no,
-                            ucc_type=:ucc_type, enc_user_id=:enc_user_id, raw_json=:raw_json
-                        WHERE mobile=:mobile""",
+                            vagaro_user_id=%(vagaro_user_id)s, first_name=%(first_name)s,
+                            last_name=%(last_name)s, email=%(email)s, birthdate=%(birthdate)s,
+                            gender=%(gender)s, address=%(address)s, city=%(city)s, state=%(state)s,
+                            zip=%(zip)s, apt_suite=%(apt_suite)s, customer_since=%(customer_since)s,
+                            last_visit=%(last_visit)s, membership=%(membership)s,
+                            referred_by=%(referred_by)s, online_booking=%(online_booking)s,
+                            tags=%(tags)s, sms_opt_out=%(sms_opt_out)s, opt_out_date=%(opt_out_date)s,
+                            email_opt_out=%(email_opt_out)s, communication_preference=%(communication_preference)s,
+                            active=%(active)s, updated_at=%(updated_at)s,
+                            acquisition=%(acquisition)s, bank_name_number=%(bank_name_number)s,
+                            cdn_url=%(cdn_url)s, country_id=%(country_id)s,
+                            custom_fields_groups=%(custom_fields_groups)s, day_phone=%(day_phone)s,
+                            email_failed_reason=%(email_failed_reason)s, email_format=%(email_format)s,
+                            general_tag=%(general_tag)s, is_valid_email=%(is_valid_email)s,
+                            is_valid_text=%(is_valid_text)s, night_phone=%(night_phone)s,
+                            no_of_booking=%(no_of_booking)s, no_of_class_booked=%(no_of_class_booked)s,
+                            no_of_class_check_ins=%(no_of_class_check_ins)s, no_show_cancel=%(no_show_cancel)s,
+                            photo=%(photo)s, service_providers=%(service_providers)s,
+                            street_address=%(street_address)s, street_no=%(street_no)s,
+                            text_failed_reason=%(text_failed_reason)s, total_amount_paid=%(total_amount_paid)s,
+                            total_points_accumulated=%(total_points_accumulated)s, ucc_no=%(ucc_no)s,
+                            ucc_type=%(ucc_type)s, enc_user_id=%(enc_user_id)s, raw_json=%(raw_json)s
+                        WHERE mobile=%(mobile)s""",
                         data,
                     )
                     result.updated += 1
@@ -284,17 +298,17 @@ class ZeyDataStore:
                              text_failed_reason, total_amount_paid, total_points_accumulated,
                              ucc_no, ucc_type, enc_user_id, raw_json)
                         VALUES
-                            (:vagaro_user_id, :mobile, :first_name, :last_name, :email,
-                             :birthdate, :gender, :address, :city, :state, :zip, :apt_suite,
-                             :customer_since, :last_visit, :membership, :referred_by,
-                             :online_booking, :tags, :active,
-                             :acquisition, :bank_name_number, :cdn_url, :country_id,
-                             :custom_fields_groups, :day_phone, :email_failed_reason, :email_format,
-                             :general_tag, :is_valid_email, :is_valid_text, :night_phone,
-                             :no_of_booking, :no_of_class_booked, :no_of_class_check_ins, :no_show_cancel,
-                             :photo, :service_providers, :street_address, :street_no,
-                             :text_failed_reason, :total_amount_paid, :total_points_accumulated,
-                             :ucc_no, :ucc_type, :enc_user_id, :raw_json)""",
+                            (%(vagaro_user_id)s, %(mobile)s, %(first_name)s, %(last_name)s, %(email)s,
+                             %(birthdate)s, %(gender)s, %(address)s, %(city)s, %(state)s, %(zip)s, %(apt_suite)s,
+                             %(customer_since)s, %(last_visit)s, %(membership)s, %(referred_by)s,
+                             %(online_booking)s, %(tags)s, %(active)s,
+                             %(acquisition)s, %(bank_name_number)s, %(cdn_url)s, %(country_id)s,
+                             %(custom_fields_groups)s, %(day_phone)s, %(email_failed_reason)s, %(email_format)s,
+                             %(general_tag)s, %(is_valid_email)s, %(is_valid_text)s, %(night_phone)s,
+                             %(no_of_booking)s, %(no_of_class_booked)s, %(no_of_class_check_ins)s, %(no_show_cancel)s,
+                             %(photo)s, %(service_providers)s, %(street_address)s, %(street_no)s,
+                             %(text_failed_reason)s, %(total_amount_paid)s, %(total_points_accumulated)s,
+                             %(ucc_no)s, %(ucc_type)s, %(enc_user_id)s, %(raw_json)s)""",
                         data,
                     )
                     result.inserted += 1
@@ -309,7 +323,7 @@ class ZeyDataStore:
             for mobile, old in existing.items():
                 if mobile not in exported_mobiles and old["active"]:
                     conn.execute(
-                        "UPDATE customers SET active=0, updated_at=? WHERE mobile=?",
+                        "UPDATE customers SET active=0, updated_at=%s WHERE mobile=%s",
                         (datetime.utcnow().isoformat(), mobile),
                     )
                     result.deactivated += 1
@@ -327,7 +341,7 @@ class ZeyDataStore:
             value = 1 if opt_out else 0
             date = datetime.utcnow().isoformat() if opt_out else None
             conn.execute(
-                "UPDATE customers SET sms_opt_out=?, opt_out_date=? WHERE mobile=?",
+                "UPDATE customers SET sms_opt_out=%s, opt_out_date=%s WHERE mobile=%s",
                 (value, date, mobile),
             )
             conn.commit()
@@ -338,10 +352,10 @@ class ZeyDataStore:
         """Get all active customers as DataFrame."""
         conn = self._conn()
         try:
-            return pd.read_sql_query(
-                "SELECT * FROM customers WHERE active=1 ORDER BY last_name, first_name",
-                conn,
+            cur = conn.execute(
+                "SELECT * FROM customers WHERE active=1 ORDER BY last_name, first_name"
             )
+            return self._rows_to_df(cur)
         finally:
             conn.close()
 
@@ -371,7 +385,7 @@ class ZeyDataStore:
                 customer_id = None
                 if mobile:
                     cust = conn.execute(
-                        "SELECT customer_id FROM customers WHERE mobile=?", (mobile,)
+                        "SELECT customer_id FROM customers WHERE mobile=%s", (mobile,)
                     ).fetchone()
                     if cust:
                         customer_id = cust["customer_id"]
@@ -386,7 +400,7 @@ class ZeyDataStore:
                         # both so a customer already on file always resolves
                         # regardless of which source this row came from.
                         cust = conn.execute(
-                            "SELECT customer_id FROM customers WHERE vagaro_user_id=? OR enc_user_id=?",
+                            "SELECT customer_id FROM customers WHERE vagaro_user_id=%s OR enc_user_id=%s",
                             (vagaro_customer_id, vagaro_customer_id),
                         ).fetchone()
                         if cust:
@@ -407,17 +421,17 @@ class ZeyDataStore:
                 }
 
                 existing = conn.execute(
-                    "SELECT service_id FROM services WHERE vagaro_appt_id=?",
+                    "SELECT service_id FROM services WHERE vagaro_appt_id=%s",
                     (vagaro_appt_id,),
                 ).fetchone()
 
                 if existing:
                     conn.execute(
-                        """UPDATE services SET customer_id=:customer_id,
-                            employee_name=:employee_name, service_name=:service_name,
-                            service_date=:service_date, duration_min=:duration_min,
-                            amount_paid=:amount_paid, notes=:notes
-                        WHERE vagaro_appt_id=:vagaro_appt_id""",
+                        """UPDATE services SET customer_id=%(customer_id)s,
+                            employee_name=%(employee_name)s, service_name=%(service_name)s,
+                            service_date=%(service_date)s, duration_min=%(duration_min)s,
+                            amount_paid=%(amount_paid)s, notes=%(notes)s
+                        WHERE vagaro_appt_id=%(vagaro_appt_id)s""",
                         data,
                     )
                     result.updated += 1
@@ -427,8 +441,8 @@ class ZeyDataStore:
                             (customer_id, employee_name, service_name, service_date,
                              duration_min, amount_paid, notes, vagaro_appt_id)
                         VALUES
-                            (:customer_id, :employee_name, :service_name, :service_date,
-                             :duration_min, :amount_paid, :notes, :vagaro_appt_id)""",
+                            (%(customer_id)s, %(employee_name)s, %(service_name)s, %(service_date)s,
+                             %(duration_min)s, %(amount_paid)s, %(notes)s, %(vagaro_appt_id)s)""",
                         data,
                     )
                     result.inserted += 1
@@ -454,7 +468,7 @@ class ZeyDataStore:
                 customer_id = None
                 if mobile:
                     cust = conn.execute(
-                        "SELECT customer_id FROM customers WHERE mobile=?", (mobile,)
+                        "SELECT customer_id FROM customers WHERE mobile=%s", (mobile,)
                     ).fetchone()
                     if cust:
                         customer_id = cust["customer_id"]
@@ -469,7 +483,7 @@ class ZeyDataStore:
                         # both so a customer already on file always resolves
                         # regardless of which source this row came from.
                         cust = conn.execute(
-                            "SELECT customer_id FROM customers WHERE vagaro_user_id=? OR enc_user_id=?",
+                            "SELECT customer_id FROM customers WHERE vagaro_user_id=%s OR enc_user_id=%s",
                             (vagaro_customer_id, vagaro_customer_id),
                         ).fetchone()
                         if cust:
@@ -484,10 +498,25 @@ class ZeyDataStore:
                     result.errors = (result.errors or []) + ["Missing transaction ID"]
                     continue
 
+                customer_name = self._str(row.get("CustomerName", row.get("Customer")))
+                if customer_name is None and customer_id is not None:
+                    # Vagaro's real transaction webhook never sends a name,
+                    # only the encrypted customerId -- fill it in from the
+                    # customer record we already resolved instead of leaving
+                    # a linked transaction with a blank name forever.
+                    known = conn.execute(
+                        "SELECT first_name, last_name FROM customers WHERE customer_id=%s",
+                        (customer_id,),
+                    ).fetchone()
+                    if known:
+                        customer_name = self._str(
+                            " ".join(part for part in (known["first_name"], known["last_name"]) if part)
+                        )
+
                 data = {
                     "vagaro_transaction_id": vagaro_transaction_id,
                     "customer_id": customer_id,
-                    "customer_name": self._str(row.get("CustomerName", row.get("Customer"))),
+                    "customer_name": customer_name,
                     "employee_name": self._resolve_employee_name(
                         conn,
                         row.get("Employee", row.get("Staff", row.get("ServiceProviderName", row.get("CheckedOutBy")))),
@@ -508,19 +537,19 @@ class ZeyDataStore:
                 }
 
                 existing = conn.execute(
-                    "SELECT transaction_id FROM transactions WHERE vagaro_transaction_id=?",
+                    "SELECT transaction_id FROM transactions WHERE vagaro_transaction_id=%s",
                     (vagaro_transaction_id,),
                 ).fetchone()
 
                 if existing:
                     conn.execute(
-                        """UPDATE transactions SET customer_id=:customer_id,
-                            customer_name=:customer_name, employee_name=:employee_name,
-                            transaction_date=:transaction_date, transaction_type=:transaction_type,
-                            payment_method=:payment_method, subtotal=:subtotal, tax=:tax,
-                            tip=:tip, discount=:discount, total_amount=:total_amount,
-                            status=:status, notes=:notes, raw_json=:raw_json
-                        WHERE vagaro_transaction_id=:vagaro_transaction_id""",
+                        """UPDATE transactions SET customer_id=%(customer_id)s,
+                            customer_name=%(customer_name)s, employee_name=%(employee_name)s,
+                            transaction_date=%(transaction_date)s, transaction_type=%(transaction_type)s,
+                            payment_method=%(payment_method)s, subtotal=%(subtotal)s, tax=%(tax)s,
+                            tip=%(tip)s, discount=%(discount)s, total_amount=%(total_amount)s,
+                            status=%(status)s, notes=%(notes)s, raw_json=%(raw_json)s
+                        WHERE vagaro_transaction_id=%(vagaro_transaction_id)s""",
                         data,
                     )
                     result.updated += 1
@@ -531,12 +560,29 @@ class ZeyDataStore:
                              transaction_date, transaction_type, payment_method, subtotal, tax,
                              tip, discount, total_amount, status, notes, raw_json)
                         VALUES
-                            (:vagaro_transaction_id, :customer_id, :customer_name, :employee_name,
-                             :transaction_date, :transaction_type, :payment_method, :subtotal, :tax,
-                             :tip, :discount, :total_amount, :status, :notes, :raw_json)""",
+                            (%(vagaro_transaction_id)s, %(customer_id)s, %(customer_name)s, %(employee_name)s,
+                             %(transaction_date)s, %(transaction_type)s, %(payment_method)s, %(subtotal)s, %(tax)s,
+                             %(tip)s, %(discount)s, %(total_amount)s, %(status)s, %(notes)s, %(raw_json)s)""",
                         data,
                     )
                     result.inserted += 1
+
+                # A completed transaction is the strongest signal that the
+                # customer actually showed up -- move last_visit forward to
+                # it (never backward, so an out-of-order/backfilled webhook
+                # can't clobber a truer, more recent value already on file).
+                if customer_id is not None and data["transaction_date"]:
+                    visit_date = self._parse_visit_date(data["transaction_date"])
+                    if visit_date is not None:
+                        current = conn.execute(
+                            "SELECT last_visit FROM customers WHERE customer_id=%s", (customer_id,)
+                        ).fetchone()
+                        current_visit = self._parse_visit_date(current["last_visit"]) if current else None
+                        if current_visit is None or current_visit < visit_date:
+                            conn.execute(
+                                "UPDATE customers SET last_visit=%s, updated_at=now()::text WHERE customer_id=%s",
+                                (visit_date.isoformat(), customer_id),
+                            )
 
             conn.commit()
         finally:
@@ -566,16 +612,16 @@ class ZeyDataStore:
                 }
 
                 existing = conn.execute(
-                    "SELECT employee_id FROM employees WHERE vagaro_emp_id=?",
+                    "SELECT employee_id FROM employees WHERE vagaro_emp_id=%s",
                     (vagaro_id,),
                 ).fetchone()
 
                 if existing:
                     conn.execute(
-                        """UPDATE employees SET name=:name, role=:role,
-                            phone=:phone, email=:email, active=:active,
-                            updated_at=datetime('now')
-                        WHERE vagaro_emp_id=:vagaro_emp_id""",
+                        """UPDATE employees SET name=%(name)s, role=%(role)s,
+                            phone=%(phone)s, email=%(email)s, active=%(active)s,
+                            updated_at=now()::text
+                        WHERE vagaro_emp_id=%(vagaro_emp_id)s""",
                         data,
                     )
                     result.updated += 1
@@ -584,7 +630,7 @@ class ZeyDataStore:
                         """INSERT INTO employees
                             (vagaro_emp_id, name, role, phone, email, active)
                         VALUES
-                            (:vagaro_emp_id, :name, :role, :phone, :email, :active)""",
+                            (%(vagaro_emp_id)s, %(name)s, %(role)s, %(phone)s, %(email)s, %(active)s)""",
                         data,
                     )
                     result.inserted += 1
@@ -614,15 +660,15 @@ class ZeyDataStore:
                 """INSERT INTO sms_history
                     (customer_id, campaign_type, message_text, status,
                      twilio_sid, error_message, campaign_row)
-                VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                VALUES (%s, %s, %s, %s, %s, %s, %s)""",
                 (customer_id, campaign_type, message_text, status,
                  twilio_sid, error_message, campaign_row),
             )
             # Also update customer's last SMS tracking
             conn.execute(
                 """UPDATE customers SET
-                    updated_at=datetime('now')
-                WHERE customer_id=?""",
+                    updated_at=now()::text
+                WHERE customer_id=%s""",
                 (customer_id,),
             )
             conn.commit()
@@ -634,7 +680,7 @@ class ZeyDataStore:
         conn = self._conn()
         try:
             row = conn.execute(
-                "SELECT sent_at FROM sms_history WHERE customer_id=? ORDER BY sent_at DESC LIMIT 1",
+                "SELECT sent_at FROM sms_history WHERE customer_id=%s ORDER BY sent_at DESC LIMIT 1",
                 (customer_id,),
             ).fetchone()
             return row["sent_at"] if row else None
@@ -646,7 +692,7 @@ class ZeyDataStore:
         conn = self._conn()
         try:
             row = conn.execute(
-                "SELECT COUNT(*) as cnt FROM sms_history WHERE customer_id=? AND campaign_type='Review'",
+                "SELECT COUNT(*) as cnt FROM sms_history WHERE customer_id=%s AND campaign_type='Review'",
                 (customer_id,),
             ).fetchone()
             return row["cnt"] > 0
@@ -670,11 +716,11 @@ class ZeyDataStore:
                 """INSERT INTO email_history
                     (customer_id, campaign_type, subject, body, status,
                      error_message, campaign_row)
-                VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                VALUES (%s, %s, %s, %s, %s, %s, %s)""",
                 (customer_id, campaign_type, subject, body, status, error_message, campaign_row),
             )
             conn.execute(
-                "UPDATE customers SET updated_at=datetime('now') WHERE customer_id=?",
+                "UPDATE customers SET updated_at=now()::text WHERE customer_id=%s",
                 (customer_id,),
             )
             conn.commit()
@@ -684,13 +730,11 @@ class ZeyDataStore:
     # ── Campaigns ──────────────────────────────────────────────
 
     def load_campaigns(self) -> pd.DataFrame:
-        """Load active campaigns from SQLite."""
+        """Load active campaigns."""
         conn = self._conn()
         try:
-            return pd.read_sql_query(
-                "SELECT * FROM campaigns WHERE active=1 ORDER BY rank",
-                conn,
-            )
+            cur = conn.execute("SELECT * FROM campaigns WHERE active=1 ORDER BY rank")
+            return self._rows_to_df(cur)
         finally:
             conn.close()
 
@@ -699,7 +743,7 @@ class ZeyDataStore:
         conn = self._conn()
         try:
             conn.execute(
-                "UPDATE campaigns SET process_date=datetime('now'), process_status=? WHERE campaign_id=?",
+                "UPDATE campaigns SET process_date=now()::text, process_status=%s WHERE campaign_id=%s",
                 (status, campaign_id),
             )
             conn.commit()
@@ -730,23 +774,23 @@ class ZeyDataStore:
 
                 # Check if similar campaign exists (by text_prompt + type)
                 existing = conn.execute(
-                    "SELECT campaign_id FROM campaigns WHERE text_prompt=? AND campaign_type=?",
+                    "SELECT campaign_id FROM campaigns WHERE text_prompt=%s AND campaign_type=%s",
                     (data["text_prompt"], data["campaign_type"]),
                 ).fetchone()
 
                 if existing:
                     conn.execute(
                         """UPDATE campaigns SET
-                            character_limit=:character_limit,
-                            filter_last_visit_days=:filter_last_visit_days,
-                            filter_last_sms_days=:filter_last_sms_days,
-                            rank=:rank, process_date=:process_date,
-                            process_status=:process_status,
-                            channels=:channels, email_subject=:email_subject,
-                            email_html=:email_html,
-                            approved=:approved, test_recipients=:test_recipients,
-                            updated_at=datetime('now')
-                        WHERE campaign_id=:campaign_id""",
+                            character_limit=%(character_limit)s,
+                            filter_last_visit_days=%(filter_last_visit_days)s,
+                            filter_last_sms_days=%(filter_last_sms_days)s,
+                            rank=%(rank)s, process_date=%(process_date)s,
+                            process_status=%(process_status)s,
+                            channels=%(channels)s, email_subject=%(email_subject)s,
+                            email_html=%(email_html)s,
+                            approved=%(approved)s, test_recipients=%(test_recipients)s,
+                            updated_at=now()::text
+                        WHERE campaign_id=%(campaign_id)s""",
                         {**data, "campaign_id": existing["campaign_id"]},
                     )
                     result.updated += 1
@@ -759,11 +803,11 @@ class ZeyDataStore:
                              channels, email_subject, email_html,
                              approved, test_recipients)
                         VALUES
-                            (:text_prompt, :character_limit, :campaign_type,
-                             :filter_last_visit_days, :filter_last_sms_days,
-                            :rank, :process_date, :process_status,
-                            :channels, :email_subject, :email_html,
-                            :approved, :test_recipients)""",
+                            (%(text_prompt)s, %(character_limit)s, %(campaign_type)s,
+                             %(filter_last_visit_days)s, %(filter_last_sms_days)s,
+                            %(rank)s, %(process_date)s, %(process_status)s,
+                            %(channels)s, %(email_subject)s, %(email_html)s,
+                            %(approved)s, %(test_recipients)s)""",
                         data,
                     )
                     result.inserted += 1
@@ -793,7 +837,7 @@ class ZeyDataStore:
                 """INSERT INTO sync_log
                     (source, records_fetched, records_inserted, records_updated,
                      records_deactivated, errors, duration_sec)
-                VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                VALUES (%s, %s, %s, %s, %s, %s, %s)""",
                 (source, fetched, inserted, updated, deactivated, errors, duration),
             )
             conn.commit()
@@ -806,7 +850,8 @@ class ZeyDataStore:
         """Export any table as a DataFrame for Google Sheets mirroring."""
         conn = self._conn()
         try:
-            frame = pd.read_sql_query(f"SELECT * FROM {table}", conn)
+            cur = conn.execute(f"SELECT * FROM {table}")
+            frame = self._rows_to_df(cur)
         finally:
             conn.close()
 
@@ -854,17 +899,20 @@ class ZeyDataStore:
         """Get summary statistics."""
         conn = self._conn()
         try:
+            def scalar(sql: str):
+                return conn.execute(sql).fetchone()["c"]
+
             return {
-                "customers_total": conn.execute("SELECT COUNT(*) FROM customers").fetchone()[0],
-                "customers_active": conn.execute("SELECT COUNT(*) FROM customers WHERE active=1").fetchone()[0],
-                "customers_opted_out": conn.execute("SELECT COUNT(*) FROM customers WHERE sms_opt_out=1").fetchone()[0],
-                "services_total": conn.execute("SELECT COUNT(*) FROM services").fetchone()[0],
-                "transactions_total": conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0],
-                "employees_active": conn.execute("SELECT COUNT(*) FROM employees WHERE active=1").fetchone()[0],
-                "sms_sent_total": conn.execute("SELECT COUNT(*) FROM sms_history").fetchone()[0],
-                "email_sent_total": conn.execute("SELECT COUNT(*) FROM email_history").fetchone()[0],
-                "campaigns_active": conn.execute("SELECT COUNT(*) FROM campaigns WHERE active=1").fetchone()[0],
-                "last_sync": conn.execute("SELECT MAX(sync_date) FROM sync_log").fetchone()[0],
+                "customers_total": scalar("SELECT COUNT(*) AS c FROM customers"),
+                "customers_active": scalar("SELECT COUNT(*) AS c FROM customers WHERE active=1"),
+                "customers_opted_out": scalar("SELECT COUNT(*) AS c FROM customers WHERE sms_opt_out=1"),
+                "services_total": scalar("SELECT COUNT(*) AS c FROM services"),
+                "transactions_total": scalar("SELECT COUNT(*) AS c FROM transactions"),
+                "employees_active": scalar("SELECT COUNT(*) AS c FROM employees WHERE active=1"),
+                "sms_sent_total": scalar("SELECT COUNT(*) AS c FROM sms_history"),
+                "email_sent_total": scalar("SELECT COUNT(*) AS c FROM email_history"),
+                "campaigns_active": scalar("SELECT COUNT(*) AS c FROM campaigns WHERE active=1"),
+                "last_sync": scalar("SELECT MAX(sync_date) AS c FROM sync_log"),
             }
         finally:
             conn.close()
@@ -903,7 +951,7 @@ class ZeyDataStore:
         if not value:
             return None
         row = conn.execute(
-            "SELECT name FROM employees WHERE vagaro_emp_id=? OR enc_emp_id=?",
+            "SELECT name FROM employees WHERE vagaro_emp_id=%s OR enc_emp_id=%s",
             (value, value),
         ).fetchone()
         if row:
@@ -933,6 +981,18 @@ class ZeyDataStore:
             return int(float(str(val).strip()))
         except (ValueError, TypeError):
             return None
+
+    @staticmethod
+    def _parse_visit_date(value):
+        """Best-effort parse of a date/timestamp string to a plain date,
+        tolerating whatever format is already on file (legacy bulk imports
+        and webhook-derived ISO timestamps look nothing alike)."""
+        if not value:
+            return None
+        parsed = pd.to_datetime(value, errors="coerce", utc=True)
+        if parsed is None or pd.isna(parsed):
+            return None
+        return parsed.date()
 
     @staticmethod
     def _float(val) -> Optional[float]:

@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import pandas as pd
 
+from sms_campaign.db import get_connection
 from sms_campaign.webhook import WebhookError, WebhookProcessor
 
 
@@ -50,6 +50,61 @@ class TestWebhookProcessor(unittest.TestCase):
             self.assertEqual(first["derived_table"], "transactions")
             self.assertEqual(second, {"status": "duplicate", "event_id": "event-1"})
 
+    def test_multi_line_item_checkout_does_not_overwrite_earlier_line_item(self) -> None:
+        """Regression test for the 2026-09-16 incident: Vagaro's transactionId
+        identifies the whole checkout and repeats across every line item when
+        a checkout sells more than one service. Using it as our uniqueness
+        key made a second line item's webhook silently overwrite the first
+        (found live: 30/83 checkouts had 2+ line items, 40 transactions lost).
+        userPaymentId is unique per line item and must be used instead. Also
+        covers: subtotal backed out from total/tax/tip when Vagaro omits it,
+        and customer_name backfilled from the resolved customer record."""
+        with TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "zey.sqlite3"
+            processor = WebhookProcessor(db_path, "secret")
+            processor.store.sync_customers(
+                pd.DataFrame([{"UserID": "cust-1", "Mobile": "5550000001", "FirstName": "Ana"}])
+            )
+            base_payload = {
+                "transactionId": "shared-checkout-1",
+                "transactionDate": "2026-09-16T15:46:51.3Z",
+                "customerId": "cust-1",
+                "purchaseType": "Service",
+                "tax": 0,
+                "discount": 0,
+            }
+            first = processor.process(
+                {"X-Vagaro-Verification-Token": "secret"},
+                json.dumps({
+                    "id": "event-line-1", "type": "transaction", "action": "created",
+                    "payload": {**base_payload, "userPaymentId": "pay-1",
+                                "itemSold": "Brow Shaping", "ccAmount": 36, "tip": 6},
+                }).encode(),
+            )
+            second = processor.process(
+                {"X-Vagaro-Verification-Token": "secret"},
+                json.dumps({
+                    "id": "event-line-2", "type": "transaction", "action": "created",
+                    "payload": {**base_payload, "userPaymentId": "pay-2",
+                                "itemSold": "Lips", "ccAmount": 12, "tip": 2},
+                }).encode(),
+            )
+            self.assertEqual(first["derived_table"], "transactions")
+            self.assertEqual(second["derived_table"], "transactions")
+
+            table = processor.store.export_table("transactions").sort_values("total_amount")
+            self.assertEqual(len(table), 2, "both line items must survive as separate rows")
+
+            lips = table.iloc[0]
+            self.assertEqual(lips["total_amount"], 12.0)
+            self.assertEqual(lips["subtotal"], 10.0)  # 12 - 0 tax - 2 tip + 0 discount
+            self.assertEqual(lips["customer_name"], "Ana")
+
+            brows = table.iloc[1]
+            self.assertEqual(brows["total_amount"], 36.0)
+            self.assertEqual(brows["subtotal"], 30.0)
+            self.assertEqual(brows["customer_name"], "Ana")
+
     def test_genuinely_incomplete_transaction_is_still_deferred(self) -> None:
         """A transaction webhook missing a truly required field (itemSold)
         must still defer to the canonical-table snapshot, not be guessed."""
@@ -73,9 +128,9 @@ class TestWebhookProcessor(unittest.TestCase):
             self.assertEqual(result["status"], "accepted")
             self.assertEqual(result["transaction_sync"], "deferred_to_complete_snapshot")
 
-            conn = sqlite3.connect(db_path)
-            self.assertEqual(conn.execute("SELECT COUNT(*) FROM webhook_events").fetchone()[0], 1)
-            self.assertEqual(conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0], 0)
+            conn = get_connection()
+            self.assertEqual(conn.execute("SELECT COUNT(*) AS c FROM webhook_events").fetchone()["c"], 1)
+            self.assertEqual(conn.execute("SELECT COUNT(*) AS c FROM transactions").fetchone()["c"], 0)
             conn.close()
 
     def test_invalid_token_is_rejected_before_persisting(self) -> None:
@@ -101,13 +156,13 @@ class TestWebhookProcessor(unittest.TestCase):
             )
             self.assertEqual(result["derived_table"], "customers")
             self.assertEqual(result["status"], "created")
-            import sqlite3
-            conn = sqlite3.connect(str(db_path))
+            conn = get_connection()
             saved = conn.execute(
                 "SELECT first_name, mobile, sms_opt_out FROM customers WHERE enc_user_id='enc-new-1'"
             ).fetchone()
-            self.assertEqual(saved[0], "Nina")
-            self.assertEqual(saved[2], 0)  # opted in by default, matching the bulk import
+            conn.close()
+            self.assertEqual(saved["first_name"], "Nina")
+            self.assertEqual(saved["sms_opt_out"], 0)  # opted in by default, matching the bulk import
 
     def test_customer_updated_webhook_never_touches_opt_out(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -126,14 +181,14 @@ class TestWebhookProcessor(unittest.TestCase):
                 }).encode(),
             )
             self.assertEqual(result["status"], "updated")
-            import sqlite3
-            conn = sqlite3.connect(str(db_path))
+            conn = get_connection()
             saved = conn.execute(
                 "SELECT first_name, city, sms_opt_out FROM customers WHERE enc_user_id='enc-1'"
             ).fetchone()
-            self.assertEqual(saved[0], "New")
-            self.assertEqual(saved[1], "Dallas")
-            self.assertEqual(saved[2], 1)  # opt-out survives the webhook update untouched
+            conn.close()
+            self.assertEqual(saved["first_name"], "New")
+            self.assertEqual(saved["city"], "Dallas")
+            self.assertEqual(saved["sms_opt_out"], 1)  # opt-out survives the webhook update untouched
 
     def test_customer_deleted_webhook_deactivates_only_that_customer(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -152,9 +207,12 @@ class TestWebhookProcessor(unittest.TestCase):
                 }).encode(),
             )
             self.assertEqual(result["status"], "deactivated")
-            import sqlite3
-            conn = sqlite3.connect(str(db_path))
-            rows = dict(conn.execute("SELECT enc_user_id, active FROM customers").fetchall())
+            conn = get_connection()
+            rows = {
+                row["enc_user_id"]: row["active"]
+                for row in conn.execute("SELECT enc_user_id, active FROM customers").fetchall()
+            }
+            conn.close()
             self.assertEqual(rows["enc-1"], 0)
             self.assertEqual(rows["enc-2"], 1)  # the other customer is untouched
 

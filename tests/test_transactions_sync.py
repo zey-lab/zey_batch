@@ -115,6 +115,36 @@ class TestTransactionsSync(unittest.TestCase):
 
         self.assertEqual(stats["transactions_total"], 1)
 
+    def test_transaction_moves_last_visit_forward_but_never_backward(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            store = ZeyDataStore(Path(temp_dir) / "zey.sqlite3")
+            store.sync_customers(pd.DataFrame([
+                {"Mobile": "5550000001", "FirstName": "Ana", "LastVisited": "2026-01-01"}
+            ]))
+            customer_id = store.get_active_customers().iloc[0]["customer_id"]
+
+            # Newer transaction: last_visit should advance.
+            store.sync_transactions(pd.DataFrame([{
+                "TransactionID": "TXN-1", "Mobile": "5550000001",
+                "TransactionDate": "2026-08-01T12:00:00+00:00", "Total": "10.00",
+            }]))
+            after_newer = store.get_active_customers()
+            self.assertEqual(
+                after_newer[after_newer["customer_id"] == customer_id].iloc[0]["last_visit"],
+                "2026-08-01",
+            )
+
+            # Older/backfilled transaction arriving later: must not roll back.
+            store.sync_transactions(pd.DataFrame([{
+                "TransactionID": "TXN-2", "Mobile": "5550000001",
+                "TransactionDate": "2026-02-01T12:00:00+00:00", "Total": "5.00",
+            }]))
+            after_older = store.get_active_customers()
+            self.assertEqual(
+                after_older[after_older["customer_id"] == customer_id].iloc[0]["last_visit"],
+                "2026-08-01",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
