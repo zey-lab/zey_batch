@@ -8,8 +8,9 @@ from unittest.mock import Mock
 import pandas as pd
 
 from sms_campaign.data_store import ZeyDataStore
+from sms_campaign.models.campaign import Campaign, CampaignProcessor
 from sms_campaign.services.sms_sender import SMSSender
-from sms_campaign.sqlite_campaigns import SQLiteCampaignRunner
+from sms_campaign.sqlite_campaigns import SQLiteCampaignRunner, SQLITE_CAMPAIGN_COLUMNS, SQLITE_CUSTOMER_COLUMNS
 
 
 class TestSQLiteCampaignRunner(unittest.TestCase):
@@ -103,6 +104,30 @@ class TestSQLiteCampaignRunner(unittest.TestCase):
             result = runner.run_campaign(runner.pending_campaigns()[0], campaign_id=1)
             self.assertEqual(result.eligible_count, 1)
             self.assertEqual(result.previews[0]["mobile"], "+15550000001")
+
+    def test_generate_message_survives_a_backslash_in_a_customer_field(self) -> None:
+        """Regression test for the 2026-09-15 incident: generate_message's
+        #column_name replacement loop passed the raw field value straight
+        into Pattern.sub() as a *replacement template*, so any customer
+        field containing a backslash sequence Python doesn't recognize as
+        a valid escape (e.g. raw_json, an address, a stray backslash-u) raised
+        re.PatternError and took down the entire campaign run before a
+        single message could send."""
+        processor = CampaignProcessor(
+            column_config=SQLITE_CAMPAIGN_COLUMNS, customer_columns=SQLITE_CUSTOMER_COLUMNS
+        )
+        campaign = Campaign(
+            row_index=0,
+            data={"text_prompt": "Hi {first_name}, thanks!", "campaign_type": "Campaign"},
+            column_config=SQLITE_CAMPAIGN_COLUMNS,
+        )
+        customer_row = pd.Series({
+            "mobile": "+15550001111",
+            "first_name": "Ana",
+            "raw_json": '{"path": "C:\\Users\\name"}',
+        })
+        message = processor.generate_message(campaign, customer_row)
+        self.assertEqual(message, "Hi Ana, thanks!")
 
 
 if __name__ == "__main__":

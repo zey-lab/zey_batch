@@ -520,7 +520,12 @@ class CampaignProcessor:
                 # Also support variations like #First_Name, #first_name
                 import re
                 pattern = re.compile(re.escape(placeholder_hash), re.IGNORECASE)
-                message = pattern.sub(str(value), message)
+                # A lambda replacement is returned verbatim -- a plain string
+                # here is parsed as a regex *replacement template*, so a
+                # customer field containing a literal backslash sequence
+                # (e.g. raw_json) crashes with "bad escape" (found
+                # 2026-09-15: took down the entire noon campaign run).
+                message = pattern.sub(lambda m: str(value), message)
 
         # Apply character limit if specified
         if campaign.character_limit and len(message) > campaign.character_limit:
