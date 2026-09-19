@@ -1,6 +1,6 @@
 """Campaign data model and processor."""
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
@@ -313,16 +313,22 @@ class CampaignProcessor:
         df = df.copy()
 
         def safe_parse(date_val):
+            # utc=True forces every parsed value to the same tz-aware UTC
+            # representation. Without it, a mix of naive strings (SQLite-era
+            # history) and offset-suffixed strings (Postgres's now()::text)
+            # in the same column parse to a mix of naive/aware Timestamps,
+            # which raises TypeError the moment two of them get compared
+            # (found 2026-09-17: crashed the whole noon run before a single
+            # message could send).
             if pd.isna(date_val):
                 return pd.NaT
-            if isinstance(date_val, (datetime, pd.Timestamp)):
-                return pd.to_datetime(date_val)
             try:
-                return pd.to_datetime(date_val)
-            except:
+                return pd.to_datetime(date_val, utc=True)
+            except (ValueError, TypeError):
                 try:
-                    return parser.parse(str(date_val))
-                except:
+                    parsed = pd.Timestamp(parser.parse(str(date_val)))
+                    return parsed.tz_localize("UTC") if parsed.tzinfo is None else parsed.tz_convert("UTC")
+                except Exception:
                     return pd.NaT
 
         df[column] = df[column].apply(safe_parse)
@@ -343,7 +349,7 @@ class CampaignProcessor:
         if df.empty:
             return df
 
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         # Normalize to midnight to compare dates only (avoid time-of-day issues)
         today_midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
         threshold = today_midnight - timedelta(days=days)
@@ -370,7 +376,7 @@ class CampaignProcessor:
         if df.empty:
             return df
 
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         # Normalize to midnight to compare dates only (avoid time-of-day issues)
         today_midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
         threshold = today_midnight - timedelta(days=days)
@@ -397,7 +403,7 @@ class CampaignProcessor:
         if df.empty:
             return df
 
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         threshold = now - timedelta(days=days)
 
         def should_include(last_sms):

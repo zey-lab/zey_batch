@@ -8,6 +8,7 @@ from unittest.mock import Mock
 import pandas as pd
 
 from sms_campaign.data_store import ZeyDataStore
+from sms_campaign.db import get_connection
 from sms_campaign.models.campaign import Campaign, CampaignProcessor
 from sms_campaign.services.sms_sender import SMSSender
 from sms_campaign.sqlite_campaigns import SQLiteCampaignRunner, SQLITE_CAMPAIGN_COLUMNS, SQLITE_CUSTOMER_COLUMNS
@@ -104,6 +105,49 @@ class TestSQLiteCampaignRunner(unittest.TestCase):
             result = runner.run_campaign(runner.pending_campaigns()[0], campaign_id=1)
             self.assertEqual(result.eligible_count, 1)
             self.assertEqual(result.previews[0]["mobile"], "+15550000001")
+
+    def test_mixed_naive_and_aware_sms_history_timestamps_do_not_crash_filtering(self) -> None:
+        """Regression test for the 2026-09-17 incident: sms_history.sent_at
+        mixes naive strings (SQLite-era history) with UTC-offset strings
+        (Postgres's now()::text default column value). pd.to_datetime on
+        that mix produced a mix of naive/aware Timestamps, which crashed the
+        whole noon run with 'TypeError: can't compare offset-naive and
+        offset-aware datetimes' before a single message could send."""
+        with TemporaryDirectory() as temp_dir:
+            store = ZeyDataStore(Path(temp_dir) / "zey.sqlite3")
+            store.sync_customers(pd.DataFrame([
+                {"UserID": "V-1", "Mobile": "5550000001", "FirstName": "Ana", "LastVisited": "2020-01-01"},
+                {"UserID": "V-2", "Mobile": "5550000002", "FirstName": "Bo", "LastVisited": "2020-01-01"},
+            ]))
+            store.import_campaigns_from_dataframe(pd.DataFrame([
+                {
+                    "Text/Prompt": "Miss you!", "Type (Campaing / Reminder)": "Campaign",
+                    "Filter-Last Visit Days": 1, "Filter-Last SMS Day": 15,
+                    "Approved": 1,
+                }
+            ]))
+            conn = get_connection()
+            customers = {
+                row["mobile"]: row["customer_id"]
+                for row in conn.execute("SELECT customer_id, mobile FROM customers").fetchall()
+            }
+            conn.execute(
+                "INSERT INTO sms_history (customer_id, campaign_type, message_text, status, sent_at) "
+                "VALUES (%s, 'Campaign', 'x', 'sent', %s)",
+                (customers["+15550000001"], "2026-01-01 00:00:00"),  # naive, SQLite-era shape
+            )
+            conn.execute(
+                "INSERT INTO sms_history (customer_id, campaign_type, message_text, status, sent_at) "
+                "VALUES (%s, 'Campaign', 'x', 'sent', %s)",
+                (customers["+15550000002"], "2026-01-01 00:00:00.123456+00"),  # aware, Postgres shape
+            )
+            conn.commit()
+            conn.close()
+
+            sender = SMSSender("", "", "", dry_run=True)
+            runner = SQLiteCampaignRunner(store, sender)
+            result = runner.run_campaign(runner.pending_campaigns()[0], campaign_id=1)  # must not raise
+            self.assertEqual(result.eligible_count, 2)
 
     def test_generate_message_survives_a_backslash_in_a_customer_field(self) -> None:
         """Regression test for the 2026-09-15 incident: generate_message's
