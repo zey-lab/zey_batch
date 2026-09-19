@@ -52,3 +52,13 @@ def _pg_truncate_between_tests(_pg_test_schema):
         yield
     finally:
         conn.close()
+
+
+@pytest.fixture(autouse=True)
+def _no_real_vagaro_api_calls(monkeypatch):
+    """Webhook ingestion can call out to Vagaro's API for an unrecognized
+    customer id -- no test should ever make that a real network call.
+    Tests that care about the behavior patch this back with a canned
+    response."""
+    monkeypatch.setattr("sms_campaign.vagaro_api.fetch_customer", lambda customer_id: None)
+

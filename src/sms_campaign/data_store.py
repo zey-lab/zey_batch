@@ -370,6 +370,21 @@ class ZeyDataStore:
         finally:
             conn.close()
 
+    def find_customer_id_by_vagaro_ref(self, vagaro_customer_id: str) -> Optional[int]:
+        """Resolve a Vagaro-supplied id (plain numeric or encrypted) to our
+        internal customer_id, without creating anything."""
+        if not vagaro_customer_id:
+            return None
+        conn = self._conn()
+        try:
+            row = conn.execute(
+                "SELECT customer_id FROM customers WHERE vagaro_user_id=%s OR enc_user_id=%s",
+                (vagaro_customer_id, vagaro_customer_id),
+            ).fetchone()
+            return row["customer_id"] if row else None
+        finally:
+            conn.close()
+
     # ── Services ───────────────────────────────────────────────
 
     def sync_services(self, df: pd.DataFrame) -> SyncResult:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hmac
 import json
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Mapping
@@ -11,8 +12,11 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+from sms_campaign import vagaro_api
 from sms_campaign.data_store import ZeyDataStore
 from sms_campaign.db import get_connection
+
+logger = logging.getLogger(__name__)
 
 SUPPORTED_TYPES = {"appointment", "customer", "employee", "transaction"}
 
@@ -103,8 +107,30 @@ class WebhookProcessor:
         if not hmac.compare_digest(supplied, self.verification_token):
             raise WebhookError("Invalid webhook verification token")
 
+    def _ensure_customer_known(self, vagaro_customer_id: str | None) -> None:
+        """Best-effort: if an appointment/transaction references a customer
+        we've never seen a 'customer' webhook for, fetch it from Vagaro's
+        API and create the record now instead of leaving the reference
+        permanently unlinked (found 2026-09-16: Vagaro doesn't reliably
+        send a companion 'customer' webhook when a walk-in books/pays).
+        Never raises -- a Vagaro API hiccup must not block ingesting the
+        appointment/transaction itself.
+        """
+        if not vagaro_customer_id:
+            return
+        if self.store.find_customer_id_by_vagaro_ref(vagaro_customer_id) is not None:
+            return
+        try:
+            data = vagaro_api.fetch_customer(vagaro_customer_id)
+        except Exception:
+            logger.exception("Vagaro API customer lookup failed for %s", vagaro_customer_id)
+            return
+        if data:
+            self.store.sync_customer_from_webhook(data, "created")
+
     def _ingest(self, event_type: str, payload: dict, action: str = "") -> dict[str, object]:
         if event_type == "transaction":
+            self._ensure_customer_known(payload.get("customerId"))
             # Vagaro transaction webhooks are compact and do not reliably
             # include customer/staff names or the complete report fields.
             # Retain the raw event above, but do not expose a partial event as
@@ -153,6 +179,7 @@ class WebhookProcessor:
             return {"derived_table": "transactions", "inserted": result.inserted, "updated": result.updated}
 
         if event_type == "appointment":
+            self._ensure_customer_known(payload.get("customerId"))
             row = {
                 "AppointmentID": payload.get("appointmentId"),
                 "CustomerID": payload.get("customerId"),

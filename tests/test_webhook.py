@@ -4,6 +4,7 @@ import json
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 import pandas as pd
 
@@ -104,6 +105,43 @@ class TestWebhookProcessor(unittest.TestCase):
             self.assertEqual(brows["total_amount"], 36.0)
             self.assertEqual(brows["subtotal"], 30.0)
             self.assertEqual(brows["customer_name"], "Ana")
+
+    def test_transaction_for_unknown_customer_creates_it_via_vagaro_api(self) -> None:
+        """Regression test for the 2026-09-16 finding: Vagaro doesn't
+        reliably send a 'customer' webhook for a walk-in who books/pays
+        directly, leaving the transaction permanently unlinked. When the
+        API is reachable, fetch and create the customer instead."""
+        with TemporaryDirectory() as temp_dir, patch(
+            "sms_campaign.webhook.vagaro_api.fetch_customer",
+            return_value={
+                "customerId": "unknown-cust-1",
+                "customerFirstName": "Nina",
+                "customerLastName": "Diaz",
+                "mobilePhone": "5550009999",
+                "email": "nina@example.com",
+            },
+        ):
+            db_path = Path(temp_dir) / "zey.sqlite3"
+            processor = WebhookProcessor(db_path, "secret")
+            event = {
+                "id": "event-unknown-cust", "type": "transaction", "action": "created",
+                "payload": {
+                    "transactionId": "txn-unknown-1", "userPaymentId": "pay-unknown-1",
+                    "transactionDate": "2026-09-16T18:59:00Z", "customerId": "unknown-cust-1",
+                    "itemSold": "Brow shaping", "ccAmount": 25.0,
+                },
+            }
+            result = processor.process(
+                {"X-Vagaro-Verification-Token": "secret"}, json.dumps(event).encode()
+            )
+            self.assertEqual(result["derived_table"], "transactions")
+
+            table = processor.store.export_table("transactions")
+            self.assertEqual(table.iloc[0]["customer_name"], "Nina Diaz")
+            self.assertIsNotNone(table.iloc[0]["customer_id"])
+
+            customers = processor.store.get_active_customers()
+            self.assertEqual(customers.iloc[0]["mobile"], "+15550009999")
 
     def test_genuinely_incomplete_transaction_is_still_deferred(self) -> None:
         """A transaction webhook missing a truly required field (itemSold)
