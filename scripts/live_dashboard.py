@@ -123,6 +123,25 @@ def fetch_dashboard_data() -> dict:
             "FROM transactions WHERE transaction_date ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}' "
             "GROUP BY day ORDER BY revenue DESC LIMIT 3"
         ).fetchall()
+
+        # Valuable customers who haven't come back yet -- stays on the list
+        # until a new transaction updates their last_visit forward, at which
+        # point they naturally drop off (or move down) on the next refresh.
+        lapsed = conn.execute(
+            """
+            SELECT t.customer_id, COALESCE(c.first_name || ' ' || c.last_name, t.customer_name) AS name,
+                   c.mobile, c.last_visit, c.sms_opt_out, c.email_opt_out,
+                   (CURRENT_DATE - c.last_visit::date) AS days_since_visit,
+                   SUM(t.total_amount) AS total_spent
+            FROM transactions t
+            LEFT JOIN customers c ON c.customer_id = t.customer_id
+            WHERE t.customer_id IS NOT NULL AND c.active = 1 AND c.last_visit IS NOT NULL
+            GROUP BY t.customer_id, c.first_name, c.last_name, t.customer_name, c.mobile,
+                     c.last_visit, c.sms_opt_out, c.email_opt_out
+            HAVING SUM(t.total_amount) > 200 AND (CURRENT_DATE - c.last_visit::date) > 30
+            ORDER BY days_since_visit DESC, total_spent DESC
+            """
+        ).fetchall()
     finally:
         conn.close()
 
@@ -131,30 +150,44 @@ def fetch_dashboard_data() -> dict:
     current_month = today_ct[:7]
 
     series = []
+    prev_revenue = None
     for r in monthly:
         m = r["month"]
         nr = nr_by_month.get(m, {"new_revenue": 0, "repeat_revenue": 0})
+        revenue = float(r["revenue"] or 0)
+        txn = r["txn"]
+        mom_growth = ((revenue - prev_revenue) / prev_revenue * 100) if prev_revenue else None
         series.append({
             "month": m,
-            "revenue": float(r["revenue"] or 0),
-            "txn": r["txn"],
+            "revenue": revenue,
+            "txn": txn,
             "cust": r["cust"],
             "newRev": float(nr["new_revenue"] or 0),
             "repeatRev": float(nr["repeat_revenue"] or 0),
             "cumCust": int(cum_by_month.get(m, 0)),
+            "avgTicket": (revenue / txn) if txn else 0.0,
+            "momGrowth": mom_growth,
             "partial": m == current_month,
         })
+        prev_revenue = revenue
+
+    revenue_today = sum(float(r["total_amount"] or 0) for r in txn_today)
+    avg_ticket_today = (revenue_today / len(txn_today)) if txn_today else 0.0
+    current_mom = series[-1]["momGrowth"] if series else None
 
     return {
         "today_ct": today_ct,
         "sms_rows": [dict(r) for r in sms_rows],
         "email_today": email_today,
         "txn_today": [dict(r) for r in txn_today],
-        "revenue_today": sum(float(r["total_amount"] or 0) for r in txn_today),
+        "revenue_today": revenue_today,
+        "avg_ticket_today": avg_ticket_today,
+        "current_mom": current_mom,
         "appts_today": appts_today,
         "optouts_today": optouts_today,
         "series": series,
         "top_days": [dict(r) for r in top_days],
+        "lapsed": [dict(r) for r in lapsed],
     }
 
 
@@ -181,10 +214,35 @@ def render_html(data: dict) -> str:
             </div>"""
         for i, (medal, d) in enumerate(zip(["🥇", "🥈", "🥉"], data["top_days"]))
     )
+    def fmt_mom(v):
+        if v is None:
+            return "—"
+        cls = "stat-good" if v >= 0 else "stat-bad"
+        sign = "+" if v >= 0 else ""
+        return f'<span class="{cls}">{sign}{v:.1f}%</span>'
+
+    def opt_badge(row):
+        tags = []
+        if row["sms_opt_out"]:
+            tags.append('<span class="badge badge-bad">SMS opt-out</span>')
+        if row["email_opt_out"]:
+            tags.append('<span class="badge badge-bad">Email opt-out</span>')
+        return " ".join(tags) or "—"
+
+    lapsed_html = "".join(
+        f"<tr><td>{html.escape(str(r['name'] or '—'))}</td>"
+        f"<td>{html.escape(str(r['mobile'] or '—'))}</td>"
+        f"<td>${float(r['total_spent'] or 0):,.2f}</td>"
+        f"<td>{r['days_since_visit']}</td>"
+        f"<td>{opt_badge(r)}</td></tr>"
+        for r in data["lapsed"]
+    )
+
     table_rows_html = "".join(
         f"<tr><td>{month_label(s['month'])}{' *' if s['partial'] else ''}</td>"
         f"<td>${s['revenue']:,.0f}</td><td>{s['txn']}</td><td>{s['cust']}</td>"
-        f"<td>${s['newRev']:,.0f}</td><td>${s['repeatRev']:,.0f}</td><td>{s['cumCust']}</td></tr>"
+        f"<td>${s['newRev']:,.0f}</td><td>${s['repeatRev']:,.0f}</td><td>{s['cumCust']}</td>"
+        f"<td>${s['avgTicket']:,.2f}</td><td>{fmt_mom(s['momGrowth'])}</td></tr>"
         for s in data["series"]
     )
     labels_json = json.dumps([month_label(s["month"]) for s in data["series"]])
@@ -194,6 +252,8 @@ def render_html(data: dict) -> str:
     cum_json = json.dumps([s["cumCust"] for s in data["series"]])
     new_rev_json = json.dumps([s["newRev"] for s in data["series"]])
     repeat_rev_json = json.dumps([s["repeatRev"] for s in data["series"]])
+    avg_ticket_json = json.dumps([s["avgTicket"] for s in data["series"]])
+    mom_json = json.dumps([s["momGrowth"] for s in data["series"]])
 
     return f"""<!DOCTYPE html>
 <html lang="tr">
@@ -241,6 +301,8 @@ def render_html(data: dict) -> str:
   .panel canvas {{ max-height: 220px; }}
   .footer-note {{ font-size: 10.5px; color: var(--text-muted); margin-top: 20px; }}
   .table-wrap {{ overflow-x: auto; }}
+  .badge {{ font-size: 10px; padding: 2px 6px; border-radius: 5px; white-space: nowrap; }}
+  .badge-bad {{ background: #fbe4e4; color: var(--bad); }}
 </style>
 </head>
 <body>
@@ -256,6 +318,8 @@ def render_html(data: dict) -> str:
     <div class="stat-tile"><div class="stat-label">Email Bugün</div><div class="stat-value">{data['email_today']}</div></div>
     <div class="stat-tile"><div class="stat-label">Randevu Bugün</div><div class="stat-value">{data['appts_today']}</div></div>
     <div class="stat-tile"><div class="stat-label">Yeni Opt-out</div><div class="stat-value">{data['optouts_today']}</div></div>
+    <div class="stat-tile"><div class="stat-label">Ortalama İşlem (Bugün)</div><div class="stat-value">${data['avg_ticket_today']:,.2f}</div></div>
+    <div class="stat-tile"><div class="stat-label">Ay-üstü-Ay Büyüme</div><div class="stat-value">{fmt_mom(data['current_mom'])}</div></div>
   </div>
 
   <p class="section-title">Bugünkü İşlemler</p>
@@ -268,6 +332,13 @@ def render_html(data: dict) -> str:
 
   <p class="section-title">En Yüksek Ciro Yapan 3 Gün (Tüm Zamanlar)</p>
   <div class="top-days">{top_days_html}</div>
+
+  <p class="section-title">Değerli Ama Uzun Süredir Gelmeyen Müşteriler</p>
+  <p class="panel-sub">$200+ harcamış, 30+ gündür gelmemiş müşteriler — geri gelene kadar burada kalır (en uzun süredir gelmeyen en üstte)</p>
+  <div class="table-wrap">
+  <table><thead><tr><th>Müşteri</th><th>Telefon</th><th>Toplam Harcama</th><th>Gün Önce</th><th>Not</th></tr></thead>
+  <tbody>{lapsed_html or '<tr><td colspan="5">Şu an listede kimse yok</td></tr>'}</tbody></table>
+  </div>
 
   <p class="section-title">Aylık Büyüme</p>
 
@@ -301,10 +372,23 @@ def render_html(data: dict) -> str:
     <canvas id="chart-cumcust"></canvas>
   </div>
 
+  <div class="panel">
+    <p class="panel-title">Ay-üstü-Ay Büyüme %</p>
+    <p class="panel-sub">Önceki aya göre ciro değişimi</p>
+    <canvas id="chart-mom"></canvas>
+  </div>
+
+  <div class="panel">
+    <p class="panel-title">Ortalama İşlem Büyüklüğü</p>
+    <p class="panel-sub">Aylık ciro / aylık işlem sayısı</p>
+    <canvas id="chart-avgticket"></canvas>
+  </div>
+
   <p class="section-title">Tablo Görünümü</p>
   <div class="table-wrap">
   <table><thead><tr><th>Ay</th><th>Ciro</th><th>İşlem</th><th>Farklı Müşteri</th>
-    <th>Yeni Müşteri Geliri</th><th>Sadık Müşteri Geliri</th><th>Kümülatif Müşteri</th></tr></thead>
+    <th>Yeni Müşteri Geliri</th><th>Sadık Müşteri Geliri</th><th>Kümülatif Müşteri</th>
+    <th>Ort. İşlem</th><th>AÜA Büyüme</th></tr></thead>
   <tbody>{table_rows_html}</tbody></table>
   </div>
 
@@ -318,6 +402,8 @@ const CUST = {cust_json};
 const CUM = {cum_json};
 const NEW_REV = {new_rev_json};
 const REPEAT_REV = {repeat_rev_json};
+const AVG_TICKET = {avg_ticket_json};
+const MOM = {mom_json};
 
 const FONT = "-apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif";
 Chart.defaults.font.family = FONT;
@@ -376,6 +462,34 @@ new Chart(document.getElementById("chart-newrepeat"), {{
     }}
   }}
 }});
+
+new Chart(document.getElementById("chart-mom"), {{
+  type: "bar",
+  data: {{
+    labels: LABELS,
+    datasets: [{{
+      label: "AÜA Büyüme %", data: MOM, borderRadius: 5, maxBarThickness: 28,
+      backgroundColor: MOM.map(v => v === null ? "#c3c2b7" : (v >= 0 ? "#1baf7a" : "#e34948"))
+    }}]
+  }},
+  options: {{
+    responsive: true,
+    plugins: {{
+      legend: {{ display: false }},
+      tooltip: {{
+        backgroundColor: "#0b0b0b", padding: 10, cornerRadius: 8,
+        titleFont: {{ family: FONT, weight: 600 }}, bodyFont: {{ family: FONT }},
+        callbacks: {{ label: (ctx) => ctx.parsed.y === null ? "veri yok" : (ctx.parsed.y >= 0 ? "+" : "") + ctx.parsed.y.toFixed(1) + "%" }}
+      }}
+    }},
+    scales: {{
+      x: {{ grid: {{ display: false }}, ticks: {{ font: {{ size: 10.5 }} }} }},
+      y: {{ grid: {{ color: "#e4e2dc" }}, ticks: {{ font: {{ size: 10.5 }}, callback: v => v + "%" }} }}
+    }}
+  }}
+}});
+
+bar("chart-avgticket", "Ortalama İşlem ($)", AVG_TICKET, "#eb6834");
 </script>
 </body>
 </html>"""
