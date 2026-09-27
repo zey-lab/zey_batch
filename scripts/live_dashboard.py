@@ -221,22 +221,17 @@ def render_html(data: dict) -> str:
         sign = "+" if v >= 0 else ""
         return f'<span class="{cls}">{sign}{v:.1f}%</span>'
 
-    def opt_badge(row):
-        tags = []
-        if row["sms_opt_out"]:
-            tags.append('<span class="badge badge-bad">SMS opt-out</span>')
-        if row["email_opt_out"]:
-            tags.append('<span class="badge badge-bad">Email opt-out</span>')
-        return " ".join(tags) or "—"
-
-    lapsed_html = "".join(
-        f"<tr><td>{html.escape(str(r['name'] or '—'))}</td>"
-        f"<td>{html.escape(str(r['mobile'] or '—'))}</td>"
-        f"<td>${float(r['total_spent'] or 0):,.2f}</td>"
-        f"<td>{r['days_since_visit']}</td>"
-        f"<td>{opt_badge(r)}</td></tr>"
+    lapsed_json = json.dumps([
+        {
+            "name": r["name"] or "—",
+            "mobile": r["mobile"] or "—",
+            "totalSpent": float(r["total_spent"] or 0),
+            "daysSince": r["days_since_visit"],
+            "smsOptOut": bool(r["sms_opt_out"]),
+            "emailOptOut": bool(r["email_opt_out"]),
+        }
         for r in data["lapsed"]
-    )
+    ])
 
     table_rows_html = "".join(
         f"<tr><td>{month_label(s['month'])}{' *' if s['partial'] else ''}</td>"
@@ -303,6 +298,17 @@ def render_html(data: dict) -> str:
   .table-wrap {{ overflow-x: auto; }}
   .badge {{ font-size: 10px; padding: 2px 6px; border-radius: 5px; white-space: nowrap; }}
   .badge-bad {{ background: #fbe4e4; color: var(--bad); }}
+  details.collapsible summary {{ cursor: pointer; list-style: none; }}
+  details.collapsible summary::-webkit-details-marker {{ display: none; }}
+  details.collapsible summary.section-title::before {{ content: "▶ "; font-size: 10px; color: var(--text-muted); }}
+  details.collapsible[open] summary.section-title::before {{ content: "▼ "; }}
+  .search-box {{
+    width: 100%; max-width: 280px; padding: 7px 10px; margin: 8px 0 10px; font-size: 12.5px;
+    border: 1px solid var(--grid); border-radius: 8px; background: var(--surface-1); color: var(--text-primary);
+  }}
+  th[data-key] {{ cursor: pointer; user-select: none; }}
+  th[data-key]:hover {{ color: var(--text-primary); }}
+  .sort-ind {{ font-size: 9px; color: var(--text-muted); }}
 </style>
 </head>
 <body>
@@ -333,12 +339,21 @@ def render_html(data: dict) -> str:
   <p class="section-title">En Yüksek Ciro Yapan 3 Gün (Tüm Zamanlar)</p>
   <div class="top-days">{top_days_html}</div>
 
-  <p class="section-title">Değerli Ama Uzun Süredir Gelmeyen Müşteriler</p>
-  <p class="panel-sub">$200+ harcamış, 30+ gündür gelmemiş müşteriler — geri gelene kadar burada kalır (en uzun süredir gelmeyen en üstte)</p>
-  <div class="table-wrap">
-  <table><thead><tr><th>Müşteri</th><th>Telefon</th><th>Toplam Harcama</th><th>Gün Önce</th><th>Not</th></tr></thead>
-  <tbody>{lapsed_html or '<tr><td colspan="5">Şu an listede kimse yok</td></tr>'}</tbody></table>
-  </div>
+  <details class="collapsible">
+    <summary class="section-title">Değerli Ama Uzun Süredir Gelmeyen Müşteriler ({len(data['lapsed'])})</summary>
+    <p class="panel-sub">$200+ harcamış, 30+ gündür gelmemiş müşteriler — geri gelene kadar burada kalır. Sütun başlığına tıklayıp sıralayın; Shift+tık ile ikinci sıralama kriteri ekleyin.</p>
+    <input type="text" id="lapsed-search" class="search-box" placeholder="İsme göre ara...">
+    <div class="table-wrap">
+    <table id="lapsed-table"><thead><tr>
+      <th data-key="name">Müşteri <span class="sort-ind"></span></th>
+      <th data-key="mobile">Telefon <span class="sort-ind"></span></th>
+      <th data-key="totalSpent">Toplam Harcama <span class="sort-ind"></span></th>
+      <th data-key="daysSince">Gün Önce <span class="sort-ind"></span></th>
+      <th>Not</th>
+    </tr></thead>
+    <tbody id="lapsed-body"></tbody></table>
+    </div>
+  </details>
 
   <p class="section-title">Aylık Büyüme</p>
 
@@ -404,6 +419,64 @@ const NEW_REV = {new_rev_json};
 const REPEAT_REV = {repeat_rev_json};
 const AVG_TICKET = {avg_ticket_json};
 const MOM = {mom_json};
+const LAPSED = {lapsed_json};
+
+// --- Lapsed-customer table: sortable (multi-key via shift-click), searchable ---
+let lapsedSort = [{{ key: "totalSpent", dir: -1 }}, {{ key: "daysSince", dir: -1 }}];
+
+function renderLapsed() {{
+  const q = document.getElementById("lapsed-search").value.trim().toLowerCase();
+  let rows = LAPSED.filter(r => !q || r.name.toLowerCase().includes(q));
+  rows.sort((a, b) => {{
+    for (const {{ key, dir }} of lapsedSort) {{
+      let av = a[key], bv = b[key];
+      if (typeof av === "string") {{ av = av.toLowerCase(); bv = bv.toLowerCase(); }}
+      if (av < bv) return -1 * dir;
+      if (av > bv) return 1 * dir;
+    }}
+    return 0;
+  }});
+  const body = document.getElementById("lapsed-body");
+  body.innerHTML = "";
+  if (!rows.length) {{
+    body.innerHTML = '<tr><td colspan="5">Sonuç yok</td></tr>';
+  }}
+  for (const r of rows) {{
+    const tr = document.createElement("tr");
+    const badges = [];
+    if (r.smsOptOut) badges.push('<span class="badge badge-bad">SMS opt-out</span>');
+    if (r.emailOptOut) badges.push('<span class="badge badge-bad">Email opt-out</span>');
+    const nameTd = document.createElement("td"); nameTd.textContent = r.name;
+    const mobileTd = document.createElement("td"); mobileTd.textContent = r.mobile;
+    const spentTd = document.createElement("td"); spentTd.textContent = "$" + r.totalSpent.toLocaleString("en-US", {{minimumFractionDigits: 2, maximumFractionDigits: 2}});
+    const daysTd = document.createElement("td"); daysTd.textContent = r.daysSince;
+    const noteTd = document.createElement("td"); noteTd.innerHTML = badges.join(" ") || "—";
+    tr.append(nameTd, mobileTd, spentTd, daysTd, noteTd);
+    body.appendChild(tr);
+  }}
+  document.querySelectorAll("#lapsed-table th[data-key]").forEach(th => {{
+    const ind = th.querySelector(".sort-ind");
+    const found = lapsedSort.findIndex(s => s.key === th.dataset.key);
+    ind.textContent = found === -1 ? "" : (lapsedSort[found].dir === 1 ? "▲" : "▼") + (lapsedSort.length > 1 ? (found + 1) : "");
+  }});
+}}
+
+document.querySelectorAll("#lapsed-table th[data-key]").forEach(th => {{
+  th.addEventListener("click", (ev) => {{
+    const key = th.dataset.key;
+    if (ev.shiftKey) {{
+      const existing = lapsedSort.find(s => s.key === key);
+      if (existing) {{ existing.dir *= -1; }}
+      else {{ lapsedSort.push({{ key, dir: -1 }}); }}
+    }} else {{
+      const existing = lapsedSort.length === 1 && lapsedSort[0].key === key;
+      lapsedSort = [{{ key, dir: existing ? lapsedSort[0].dir * -1 : -1 }}];
+    }}
+    renderLapsed();
+  }});
+}});
+document.getElementById("lapsed-search").addEventListener("input", renderLapsed);
+renderLapsed();
 
 const FONT = "-apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif";
 Chart.defaults.font.family = FONT;
