@@ -181,63 +181,71 @@ def render_html(data: dict) -> str:
             </div>"""
         for i, (medal, d) in enumerate(zip(["🥇", "🥈", "🥉"], data["top_days"]))
     )
-    series_json = json.dumps(data["series"])
-    month_labels_json = json.dumps({s["month"]: month_label(s["month"]) for s in data["series"]})
+    table_rows_html = "".join(
+        f"<tr><td>{month_label(s['month'])}{' *' if s['partial'] else ''}</td>"
+        f"<td>${s['revenue']:,.0f}</td><td>{s['txn']}</td><td>{s['cust']}</td>"
+        f"<td>${s['newRev']:,.0f}</td><td>${s['repeatRev']:,.0f}</td><td>{s['cumCust']}</td></tr>"
+        for s in data["series"]
+    )
+    labels_json = json.dumps([month_label(s["month"]) for s in data["series"]])
+    revenue_json = json.dumps([s["revenue"] for s in data["series"]])
+    txn_json = json.dumps([s["txn"] for s in data["series"]])
+    cust_json = json.dumps([s["cust"] for s in data["series"]])
+    cum_json = json.dumps([s["cumCust"] for s in data["series"]])
+    new_rev_json = json.dumps([s["newRev"] for s in data["series"]])
+    repeat_rev_json = json.dumps([s["repeatRev"] for s in data["series"]])
 
     return f"""<!DOCTYPE html>
 <html lang="tr">
 <head>
 <meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="refresh" content="120">
-<title>Zey Brow &amp; Wax — Canlı Panel</title>
+<title>Canlı Panel</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
 <style>
-  .viz-root {{
-    color-scheme: light;
+  :root {{
     --surface-1: #fcfcfb; --surface-2: #f3f2ef; --text-primary: #0b0b0b;
     --text-secondary: #52514e; --text-muted: #86847c; --grid: #e4e2dc;
     --series-1: #2a78d6; --series-2: #eb6834; --series-3: #1baf7a; --series-4: #4a3aa7;
-    --partial: #c3c2b7; --good: #1baf7a; --bad: #e34948;
+    --good: #1baf7a; --bad: #e34948;
   }}
   * {{ box-sizing: border-box; }}
   body {{ margin: 0; font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
     background: var(--surface-1); color: var(--text-primary); }}
-  .viz-root {{ padding: 24px 28px 40px; max-width: 980px; margin: 0 auto; }}
-  h1 {{ font-size: 19px; margin: 0 0 4px; font-weight: 650; }}
+  .viz-root {{ padding: 24px 20px 48px; max-width: 1000px; margin: 0 auto; }}
+  h1 {{ font-size: 20px; margin: 0 0 4px; font-weight: 700; }}
   .subtitle {{ font-size: 12.5px; color: var(--text-secondary); margin: 0 0 22px; }}
   .stat-row {{ display: flex; gap: 12px; margin-bottom: 22px; flex-wrap: wrap; }}
-  .stat-tile {{ flex: 1; min-width: 140px; background: var(--surface-2); border-radius: 10px; padding: 12px 14px; }}
+  .stat-tile {{ flex: 1; min-width: 140px; background: var(--surface-2); border-radius: 12px; padding: 14px 16px;
+    box-shadow: 0 1px 2px rgba(0,0,0,.04); }}
   .stat-label {{ font-size: 11px; color: var(--text-secondary); margin-bottom: 4px; }}
-  .stat-value {{ font-size: 21px; font-weight: 650; font-variant-numeric: tabular-nums; }}
+  .stat-value {{ font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; }}
   .stat-good {{ color: var(--good); }} .stat-bad {{ color: var(--bad); }}
-  .section-title {{ font-size: 14px; font-weight: 650; margin: 26px 0 8px; }}
-  table {{ width: 100%; border-collapse: collapse; font-size: 12px; }}
-  th, td {{ text-align: right; padding: 5px 8px; border-bottom: 1px solid var(--grid); font-variant-numeric: tabular-nums; }}
+  .section-title {{ font-size: 15px; font-weight: 700; margin: 30px 0 10px; }}
+  table {{ width: 100%; border-collapse: collapse; font-size: 12.5px; }}
+  th, td {{ text-align: right; padding: 6px 8px; border-bottom: 1px solid var(--grid); font-variant-numeric: tabular-nums; }}
   th:first-child, td:first-child {{ text-align: left; }}
   th {{ color: var(--text-secondary); font-weight: 600; }}
-  .top-days {{ display: flex; gap: 12px; margin-bottom: 10px; }}
-  .top-day-tile {{ flex: 1; background: var(--surface-2); border-radius: 10px; padding: 14px 16px; }}
+  .top-days {{ display: flex; gap: 12px; margin-bottom: 10px; flex-wrap: wrap; }}
+  .top-day-tile {{ flex: 1; min-width: 180px; background: var(--surface-2); border-radius: 12px; padding: 16px 18px;
+    box-shadow: 0 1px 2px rgba(0,0,0,.04); }}
   .top-day-rank {{ font-size: 12px; color: var(--text-secondary); margin-bottom: 4px; }}
   .top-day-date {{ font-size: 12.5px; color: var(--text-secondary); margin-bottom: 2px; }}
-  .top-day-rev {{ font-size: 20px; font-weight: 650; font-variant-numeric: tabular-nums; }}
+  .top-day-rev {{ font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; }}
   .top-day-meta {{ font-size: 11px; color: var(--text-muted); margin-top: 4px; }}
-  .panel {{ margin-bottom: 26px; }}
-  .panel-title {{ font-size: 13px; font-weight: 650; margin: 0 0 2px; }}
-  .panel-sub {{ font-size: 11.5px; color: var(--text-muted); margin: 0 0 8px; }}
-  .val-zone {{ height: 16px; display: flex; align-items: flex-end; justify-content: center; margin-bottom: 4px; width: 100%; }}
-  .bar-val {{ font-size: 10px; color: var(--text-secondary); white-space: nowrap; font-variant-numeric: tabular-nums; }}
-  .track {{ position: relative; height: 90px; width: 100%; }}
-  .chart {{ display: flex; gap: 5px; position: relative; }}
-  .bar-col {{ flex: 1; display: flex; flex-direction: column; align-items: center; position: relative; }}
-  .bar {{ width: 18px; border-radius: 3px 3px 0 0; position: absolute; bottom: 0; left: 50%; transform: translateX(-50%); }}
-  .bar.partial {{ opacity: .55; background-image: repeating-linear-gradient(45deg, rgba(255,255,255,.25) 0 2px, transparent 2px 6px); }}
-  .bar-label {{ font-size: 9px; color: var(--text-muted); margin-top: 5px; }}
-  .gridline {{ position: absolute; left: 0; right: 0; height: 1px; background: var(--grid); }}
+  .panel {{ margin-bottom: 30px; background: var(--surface-2); border-radius: 14px; padding: 16px 18px 8px;
+    box-shadow: 0 1px 2px rgba(0,0,0,.04); }}
+  .panel-title {{ font-size: 13.5px; font-weight: 700; margin: 0 0 2px; }}
+  .panel-sub {{ font-size: 11.5px; color: var(--text-muted); margin: 0 0 10px; }}
+  .panel canvas {{ max-height: 220px; }}
   .footer-note {{ font-size: 10.5px; color: var(--text-muted); margin-top: 20px; }}
+  .table-wrap {{ overflow-x: auto; }}
 </style>
 </head>
 <body>
 <div class="viz-root">
-  <h1>Zey Brow &amp; Wax — Canlı Panel</h1>
+  <h1>Canlı Panel</h1>
   <p class="subtitle">Bugün: {data['today_ct']} (CDT) · her 2 dakikada otomatik güncellenir · üretildi: {datetime.now(ZoneInfo('America/Chicago')).strftime('%H:%M:%S')}</p>
 
   <div class="stat-row">
@@ -251,65 +259,123 @@ def render_html(data: dict) -> str:
   </div>
 
   <p class="section-title">Bugünkü İşlemler</p>
-  <table><thead><tr><th>Müşteri</th><th>Tutar</th><th>Saat</th></tr></thead>
-  <tbody>{txn_rows_html or '<tr><td colspan="3">Henüz işlem yok</td></tr>'}</tbody></table>
+  <div class="table-wrap"><table><thead><tr><th>Müşteri</th><th>Tutar</th><th>Saat</th></tr></thead>
+  <tbody>{txn_rows_html or '<tr><td colspan="3">Henüz işlem yok</td></tr>'}</tbody></table></div>
 
   <p class="section-title">SMS Kırılımı (Bugün)</p>
-  <table><thead><tr><th>Tip</th><th>Durum</th><th>Adet</th></tr></thead>
-  <tbody>{sms_breakdown or '<tr><td colspan="3">Henüz gönderim yok</td></tr>'}</tbody></table>
+  <div class="table-wrap"><table><thead><tr><th>Tip</th><th>Durum</th><th>Adet</th></tr></thead>
+  <tbody>{sms_breakdown or '<tr><td colspan="3">Henüz gönderim yok</td></tr>'}</tbody></table></div>
 
   <p class="section-title">En Yüksek Ciro Yapan 3 Gün (Tüm Zamanlar)</p>
   <div class="top-days">{top_days_html}</div>
 
   <p class="section-title">Aylık Büyüme</p>
+
   <div class="panel">
     <p class="panel-title">Aylık Ciro</p>
-    <div class="chart" id="chart-revenue"></div>
-  </div>
-  <div class="panel">
-    <p class="panel-title">Aylık Farklı Müşteri Sayısı</p>
-    <div class="chart" id="chart-cust"></div>
-  </div>
-  <div class="panel">
-    <p class="panel-title">Kümülatif Toplam Müşteri Sayısı</p>
-    <div class="chart" id="chart-cumcust"></div>
+    <p class="panel-sub">Toplam tahsilat ($)</p>
+    <canvas id="chart-revenue"></canvas>
   </div>
 
-  <p class="footer-note">Çizgili son çubuk, ay henüz tamamlanmadı. Bu sayfa erişimi istendiğinde kapatılabilir.</p>
+  <div class="panel">
+    <p class="panel-title">Yeni Müşteri vs Sadık Müşteri Geliri</p>
+    <p class="panel-sub">O ay ilk kez gelenlerden gelen gelir (yeni) vs daha önce gelmiş müşterilerden gelen gelir (sadık)</p>
+    <canvas id="chart-newrepeat"></canvas>
+  </div>
+
+  <div class="panel">
+    <p class="panel-title">Aylık İşlem Sayısı</p>
+    <p class="panel-sub">Toplam satış/ziyaret adedi</p>
+    <canvas id="chart-txn"></canvas>
+  </div>
+
+  <div class="panel">
+    <p class="panel-title">Aylık Farklı Müşteri Sayısı</p>
+    <p class="panel-sub">O ay en az bir kez gelen benzersiz müşteri sayısı</p>
+    <canvas id="chart-cust"></canvas>
+  </div>
+
+  <div class="panel">
+    <p class="panel-title">Kümülatif Toplam Müşteri Sayısı</p>
+    <p class="panel-sub">Şimdiye kadar en az bir kez gelmiş, benzersiz müşteri toplamı</p>
+    <canvas id="chart-cumcust"></canvas>
+  </div>
+
+  <p class="section-title">Tablo Görünümü</p>
+  <div class="table-wrap">
+  <table><thead><tr><th>Ay</th><th>Ciro</th><th>İşlem</th><th>Farklı Müşteri</th>
+    <th>Yeni Müşteri Geliri</th><th>Sadık Müşteri Geliri</th><th>Kümülatif Müşteri</th></tr></thead>
+  <tbody>{table_rows_html}</tbody></table>
+  </div>
+
+  <p class="footer-note">* = ay henüz tamamlanmadı, diğer aylarla doğrudan kıyaslanmamalı.</p>
 </div>
 <script>
-const DATA = {series_json};
-const MONTH_LABELS = {month_labels_json};
-const TRACK_PX = 90, VAL_ZONE = 16;
-function fmtMoney(v) {{ return "$" + v.toLocaleString("en-US", {{maximumFractionDigits: 0}}); }}
-function fmtInt(v) {{ return v.toLocaleString("en-US"); }}
-function addGridlines(el) {{
-  [0, 0.5, 1].forEach(f => {{
-    const g = document.createElement("div"); g.className = "gridline";
-    g.style.top = (VAL_ZONE + (1 - f) * TRACK_PX) + "px"; el.appendChild(g);
+const LABELS = {labels_json};
+const REVENUE = {revenue_json};
+const TXN = {txn_json};
+const CUST = {cust_json};
+const CUM = {cum_json};
+const NEW_REV = {new_rev_json};
+const REPEAT_REV = {repeat_rev_json};
+
+const FONT = "-apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif";
+Chart.defaults.font.family = FONT;
+Chart.defaults.color = "#52514e";
+
+function baseOptions(moneyAxis) {{
+  return {{
+    responsive: true,
+    plugins: {{
+      legend: {{ display: false }},
+      tooltip: {{
+        backgroundColor: "#0b0b0b", padding: 10, cornerRadius: 8,
+        titleFont: {{ family: FONT, weight: 600 }}, bodyFont: {{ family: FONT }},
+        callbacks: moneyAxis ? {{
+          label: (ctx) => ctx.dataset.label ? ctx.dataset.label + ": $" + ctx.parsed.y.toLocaleString("en-US") :
+                          "$" + ctx.parsed.y.toLocaleString("en-US")
+        }} : {{}}
+      }}
+    }},
+    scales: {{
+      x: {{ grid: {{ display: false }}, ticks: {{ font: {{ size: 10.5 }} }} }},
+      y: {{ beginAtZero: true, grid: {{ color: "#e4e2dc" }},
+            ticks: {{ font: {{ size: 10.5 }}, callback: v => moneyAxis ? "$" + v.toLocaleString("en-US") : v }} }}
+    }}
+  }};
+}}
+
+function bar(id, label, data, color) {{
+  new Chart(document.getElementById(id), {{
+    type: "bar",
+    data: {{ labels: LABELS, datasets: [{{ label, data, backgroundColor: color, borderRadius: 5, maxBarThickness: 28 }}] }},
+    options: baseOptions(label.includes("$") || label.includes("Ciro") || label.includes("Geliri"))
   }});
 }}
-function renderChart(containerId, key, colorVar, formatter) {{
-  const el = document.getElementById(containerId);
-  const max = Math.max(...DATA.map(d => d[key]), 1);
-  addGridlines(el);
-  DATA.forEach(d => {{
-    const col = document.createElement("div"); col.className = "bar-col";
-    const valZone = document.createElement("div"); valZone.className = "val-zone";
-    const val = document.createElement("div"); val.className = "bar-val";
-    val.textContent = formatter(d[key]); valZone.appendChild(val); col.appendChild(valZone);
-    const track = document.createElement("div"); track.className = "track";
-    const bar = document.createElement("div"); bar.className = "bar" + (d.partial ? " partial" : "");
-    bar.style.height = Math.max((d[key] / max) * TRACK_PX, 2) + "px";
-    bar.style.background = `var(${{colorVar}})`; track.appendChild(bar); col.appendChild(track);
-    const label = document.createElement("div"); label.className = "bar-label";
-    label.textContent = MONTH_LABELS[d.month]; col.appendChild(label);
-    el.appendChild(col);
-  }});
-}}
-renderChart("chart-revenue", "revenue", "--series-1", fmtMoney);
-renderChart("chart-cust", "cust", "--series-3", fmtInt);
-renderChart("chart-cumcust", "cumCust", "--series-4", fmtInt);
+
+bar("chart-revenue", "Ciro ($)", REVENUE, "#2a78d6");
+bar("chart-txn", "İşlem", TXN, "#eb6834");
+bar("chart-cust", "Farklı Müşteri", CUST, "#1baf7a");
+bar("chart-cumcust", "Kümülatif Müşteri", CUM, "#4a3aa7");
+
+new Chart(document.getElementById("chart-newrepeat"), {{
+  type: "bar",
+  data: {{
+    labels: LABELS,
+    datasets: [
+      {{ label: "Yeni müşteri", data: NEW_REV, backgroundColor: "#2a78d6", borderRadius: 5, maxBarThickness: 20 }},
+      {{ label: "Sadık müşteri", data: REPEAT_REV, backgroundColor: "#eb6834", borderRadius: 5, maxBarThickness: 20 }}
+    ]
+  }},
+  options: {{
+    ...baseOptions(true),
+    plugins: {{
+      ...baseOptions(true).plugins,
+      legend: {{ display: true, position: "top", align: "start",
+        labels: {{ boxWidth: 10, boxHeight: 10, font: {{ size: 11.5 }} }} }}
+    }}
+  }}
+}});
 </script>
 </body>
 </html>"""
