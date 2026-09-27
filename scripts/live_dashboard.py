@@ -47,6 +47,80 @@ def month_label(month: str) -> str:
     return f"{MONTH_LABELS_TR[m]} {y[2:]}"
 
 
+def build_insights(series: list[dict], active_staff: int) -> dict:
+    """Freshly derives good/attention-needed signals from the same monthly
+    series the charts use -- no hardcoded numbers, so it moves with the data
+    on every request. Only full (non-partial) months are used for growth-rate
+    comparisons so an in-progress month never skews the trend."""
+    full = [s for s in series if not s["partial"]]
+    good: list[str] = []
+    watch: list[dict] = []
+
+    def avg(items: list[dict], key: str) -> float | None:
+        vals = [i[key] for i in items]
+        return sum(vals) / len(vals) if vals else None
+
+    if len(full) >= 9:
+        recent, mid, early = full[-3:], full[-6:-3], full[-9:-6]
+        recent_txn, mid_txn, early_txn = avg(recent, "txn"), avg(mid, "txn"), avg(early, "txn")
+        recent_rev, mid_rev, early_rev = avg(recent, "revenue"), avg(mid, "revenue"), avg(early, "revenue")
+
+        txn_growth_recent = (recent_txn / mid_txn - 1) * 100 if mid_txn else None
+        txn_growth_prior = (mid_txn / early_txn - 1) * 100 if early_txn else None
+        rev_growth_recent = (recent_rev / mid_rev - 1) * 100 if mid_rev else None
+        rev_growth_prior = (mid_rev / early_rev - 1) * 100 if early_rev else None
+
+        recent_months_txt = ", ".join(month_label(s["month"]) for s in recent)
+        trend_6mo_txn = " → ".join(str(s["txn"]) for s in (mid + recent))
+        trend_6mo_rev = " → ".join(f"${s['revenue']:,.0f}" for s in (mid + recent))
+
+        if txn_growth_recent is not None and txn_growth_prior is not None and txn_growth_recent < txn_growth_prior * 0.6:
+            per_day = recent_txn / 25 if recent_txn else 0
+            watch.append({
+                "issue": f"İşlem hacmindeki büyüme hızı yavaşlıyor: son 3 ayda ({recent_months_txt}) ortalama aylık büyüme %{txn_growth_recent:.0f}, önceki 3 ayda %{txn_growth_prior:.0f} idi.",
+                "why": (
+                    f"Sistemde tek aktif hizmet sağlayıcı görünüyor ({active_staff} kişi), ayda ortalama {recent_txn:.0f} işlem "
+                    f"dönüyor -- bu günde yaklaşık {per_day:.0f} randevuya denk geliyor. Bu, tek kişilik kapasitenin sınırına "
+                    "yaklaşıldığının işareti olabilir."
+                ),
+                "action": "İkinci bir uzman/çalışan alımını veya mevcut çalışma saatleri/gün sayısının artırılmasını değerlendirin.",
+                "trend": f"Son 6 ay işlem sayısı: {trend_6mo_txn}",
+            })
+
+        if rev_growth_recent is not None and rev_growth_prior is not None and rev_growth_recent < rev_growth_prior * 0.7:
+            watch.append({
+                "issue": f"Ciro büyüme hızı yavaşlıyor: son 3 ayda ortalama %{rev_growth_recent:.0f}, önceki 3 ayda %{rev_growth_prior:.0f}.",
+                "why": (
+                    "Bu kısmen normaldir (taban büyüdükçe yüzdesel büyüme doğal olarak yavaşlar), ama işlem hacmi de aynı "
+                    "yönde yavaşlıyorsa asıl sebep kapasite sınırı olabilir."
+                ),
+                "action": "Kapasite artırıldıktan (yukarıdaki madde) sonra yeni müşteri akışını hızlandırmak için Google Ads / sosyal medya reklamı ya da referans programı değerlendirilebilir.",
+                "trend": f"Son 6 ay ciro: {trend_6mo_rev}",
+            })
+
+    if len(full) >= 2:
+        first_ticket, last_ticket = full[0]["avgTicket"], full[-1]["avgTicket"]
+        if last_ticket > first_ticket * 1.15:
+            good.append(
+                f"Ortalama işlem büyüklüğü yükseliyor: {month_label(full[0]['month'])} döneminde ${first_ticket:.2f} idi, "
+                f"şimdi ${last_ticket:.2f} — fiyatlandırma/hizmet karması güçleniyor."
+            )
+
+        last, prev = full[-1], full[-2]
+        share_now = (last["repeatRev"] / last["revenue"] * 100) if last["revenue"] else 0
+        share_prev = (prev["repeatRev"] / prev["revenue"] * 100) if prev["revenue"] else 0
+        if share_now > share_prev + 5:
+            good.append(
+                f"Sadık müşteri geliri payı hızla artıyor: {month_label(prev['month'])} döneminde %{share_prev:.0f}, "
+                f"{month_label(last['month'])} döneminde %{share_now:.0f} — elde tutma/sadakat güçlü çalışıyor."
+            )
+
+    if series:
+        good.append(f"Toplam müşteri tabanı istikrarlı büyüyor: şu an {series[-1]['cumCust']} kümülatif müşteri.")
+
+    return {"good": good, "watch": watch}
+
+
 def fetch_dashboard_data() -> dict:
     today_ct = datetime.now(ZoneInfo("America/Chicago")).date().isoformat()
     conn = get_connection()
@@ -142,6 +216,10 @@ def fetch_dashboard_data() -> dict:
             ORDER BY days_since_visit DESC, total_spent DESC
             """
         ).fetchall()
+
+        active_staff = conn.execute(
+            "SELECT COUNT(DISTINCT name) c FROM employees WHERE active = 1"
+        ).fetchone()["c"]
     finally:
         conn.close()
 
@@ -174,6 +252,7 @@ def fetch_dashboard_data() -> dict:
     revenue_today = sum(float(r["total_amount"] or 0) for r in txn_today)
     avg_ticket_today = (revenue_today / len(txn_today)) if txn_today else 0.0
     current_mom = series[-1]["momGrowth"] if series else None
+    insights = build_insights(series, active_staff)
 
     return {
         "today_ct": today_ct,
@@ -188,6 +267,7 @@ def fetch_dashboard_data() -> dict:
         "series": series,
         "top_days": [dict(r) for r in top_days],
         "lapsed": [dict(r) for r in lapsed],
+        "insights": insights,
     }
 
 
@@ -240,6 +320,17 @@ def render_html(data: dict) -> str:
         f"<td>${s['avgTicket']:,.2f}</td><td>{fmt_mom(s['momGrowth'])}</td></tr>"
         for s in data["series"]
     )
+    good_html = "".join(f"<li>{html.escape(g)}</li>" for g in data["insights"]["good"])
+    watch_html = "".join(
+        f"""<div class="insight-card">
+              <p class="insight-issue">⚠️ {html.escape(w['issue'])}</p>
+              <p class="insight-why">{html.escape(w['why'])}</p>
+              <p class="insight-action"><strong>Aksiyon:</strong> {html.escape(w['action'])}</p>
+              <p class="insight-trend">{html.escape(w['trend'])}</p>
+            </div>"""
+        for w in data["insights"]["watch"]
+    )
+
     labels_json = json.dumps([month_label(s["month"]) for s in data["series"]])
     revenue_json = json.dumps([s["revenue"] for s in data["series"]])
     txn_json = json.dumps([s["txn"] for s in data["series"]])
@@ -309,12 +400,36 @@ def render_html(data: dict) -> str:
   th[data-key] {{ cursor: pointer; user-select: none; }}
   th[data-key]:hover {{ color: var(--text-primary); }}
   .sort-ind {{ font-size: 9px; color: var(--text-muted); }}
+  .insight-panel {{ background: var(--surface-2); border-radius: 14px; padding: 18px 20px 10px; margin-bottom: 26px;
+    box-shadow: 0 1px 2px rgba(0,0,0,.04); border-left: 4px solid var(--series-1); }}
+  .insight-heading {{ font-size: 13px; font-weight: 700; margin: 16px 0 8px; }}
+  .insight-heading-good {{ color: var(--good); }}
+  .insight-heading-watch {{ color: #b8862f; }}
+  .insight-good-list {{ margin: 0 0 6px; padding-left: 20px; font-size: 12.5px; line-height: 1.6; }}
+  .insight-card {{ background: var(--surface-1); border-radius: 10px; padding: 12px 14px; margin-bottom: 10px;
+    border: 1px solid var(--grid); }}
+  .insight-issue {{ font-size: 12.5px; font-weight: 700; margin: 0 0 5px; }}
+  .insight-why {{ font-size: 12px; color: var(--text-secondary); margin: 0 0 6px; }}
+  .insight-action {{ font-size: 12px; margin: 0 0 6px; }}
+  .insight-trend {{ font-size: 11px; color: var(--text-muted); margin: 0; font-variant-numeric: tabular-nums; }}
 </style>
 </head>
 <body>
 <div class="viz-root">
   <h1>Canlı Panel</h1>
   <p class="subtitle">Bugün: {data['today_ct']} (CDT) · her 2 dakikada otomatik güncellenir · üretildi: {datetime.now(ZoneInfo('America/Chicago')).strftime('%H:%M:%S')}</p>
+
+  <div class="insight-panel">
+    <p class="section-title" style="margin-top:0">Durum Değerlendirmesi ve Aksiyon Planı</p>
+    <p class="panel-sub">Bu bölüm her açılışta güncel verilerden yeniden hesaplanır — statik bir yorum değildir.</p>
+
+    <p class="insight-heading insight-heading-good">✅ Güzel Giden Şeyler</p>
+    <ul class="insight-good-list">{good_html or '<li>Henüz yeterli veri yok.</li>'}</ul>
+
+    <p class="insight-heading insight-heading-watch">🔍 Sıkıntı Olan Şeyler ve Yapılması Gereken Aksiyonlar</p>
+    {watch_html or '<p class="panel-sub">Şu an dikkat gerektiren bir sinyal tespit edilmedi.</p>'}
+    <p class="footer-note">Her kutunun altındaki "Son 6 ay" satırı, bir sonraki ziyaretinizde aynı sinyalin düzelip düzelmediğini kendi gözünüzle karşılaştırmanız için var.</p>
+  </div>
 
   <div class="stat-row">
     <div class="stat-tile"><div class="stat-label">Bugünkü Ciro</div><div class="stat-value">${data['revenue_today']:,.2f}</div></div>
