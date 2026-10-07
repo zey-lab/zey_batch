@@ -458,7 +458,6 @@ def render_html(data: dict) -> str:
 
   <div class="stat-row">
     <div class="stat-tile"><div class="stat-label">Bugünkü Ciro</div><div class="stat-value">${data['revenue_today']:,.2f}</div></div>
-    <div class="stat-tile"><div class="stat-label">Bugünkü İşlem</div><div class="stat-value">{len(data['txn_today'])}</div></div>
     <div class="stat-tile"><div class="stat-label">SMS (başarılı/başarısız)</div>
       <div class="stat-value"><span class="stat-good">{sms_ok}</span> / <span class="stat-bad">{sms_fail}</span></div></div>
     <div class="stat-tile"><div class="stat-label">Email Bugün</div><div class="stat-value">{data['email_today']}</div></div>
