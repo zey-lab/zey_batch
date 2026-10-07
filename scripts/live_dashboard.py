@@ -136,8 +136,13 @@ def fetch_dashboard_data() -> dict:
             "WHERE (sent_at::timestamptz AT TIME ZONE 'America/Chicago')::date=%s",
             (today_ct,),
         ).fetchone()["c"]
+        # cust_key identifies the paying customer even before they're in our
+        # customers table (Vagaro's id from raw_json), for the per-customer
+        # average; a row with neither counts as its own customer.
         txn_today = conn.execute(
             "SELECT customer_name, total_amount, "
+            "COALESCE(customer_id::text, substring(raw_json from '\"CustomerID\": \"?([^\",}]+)'), "
+            "'txn-' || transaction_id) AS cust_key, "
             "transaction_date::timestamptz AT TIME ZONE 'America/Chicago' AS local_time "
             "FROM transactions WHERE (transaction_date::timestamptz AT TIME ZONE 'America/Chicago')::date=%s "
             "ORDER BY local_time",
@@ -274,7 +279,8 @@ def fetch_dashboard_data() -> dict:
         prev_revenue = revenue
 
     revenue_today = sum(float(r["total_amount"] or 0) for r in txn_today)
-    avg_ticket_today = (revenue_today / len(txn_today)) if txn_today else 0.0
+    customers_today = len({r["cust_key"] for r in txn_today})
+    avg_per_customer_today = (revenue_today / customers_today) if customers_today else 0.0
     current_mom = series[-1]["momGrowth"] if series else None
     insights = build_insights(series, active_staff)
 
@@ -284,7 +290,7 @@ def fetch_dashboard_data() -> dict:
         "email_today": email_today,
         "txn_today": [dict(r) for r in txn_today],
         "revenue_today": revenue_today,
-        "avg_ticket_today": avg_ticket_today,
+        "avg_per_customer_today": avg_per_customer_today,
         "current_mom": current_mom,
         "appts_today": appts_today,
         "optouts_today": optouts_today,
@@ -467,7 +473,7 @@ def render_html(data: dict) -> str:
       <div class="stat-value"><span class="stat-good">{data['appts_today']['services_done']}</span> / {data['appts_today']['services']}</div>
       {f'<div class="stat-sub">{data["appts_today"]["cancelled"]} iptal/silinen hariç</div>' if data['appts_today']['cancelled'] else ''}</div>
     <div class="stat-tile"><div class="stat-label">Yeni Opt-out</div><div class="stat-value">{data['optouts_today']}</div></div>
-    <div class="stat-tile"><div class="stat-label">Ortalama İşlem (Bugün)</div><div class="stat-value">${data['avg_ticket_today']:,.2f}</div></div>
+    <div class="stat-tile"><div class="stat-label">Müşteri Başı Ortalama (Bugün)</div><div class="stat-value">${data['avg_per_customer_today']:,.2f}</div></div>
     <div class="stat-tile"><div class="stat-label">Ay-üstü-Ay Büyüme</div><div class="stat-value">{fmt_mom(data['current_mom'])}</div></div>
   </div>
 
