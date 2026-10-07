@@ -143,11 +143,35 @@ def fetch_dashboard_data() -> dict:
             "ORDER BY local_time",
             (today_ct,),
         ).fetchall()
+        # A visit can book several services (one row each), so an appointment
+        # is one customer's services for the day -- keyed by customer_id, or by
+        # the Vagaro customer ref from the appointment webhook while the
+        # customer isn't in our table yet. Status is Vagaro's own
+        # bookingStatus: Cancel/Deleted are excluded, "Service Completed" is
+        # done; an appointment is done once any of its services is.
         appts_today = conn.execute(
-            "SELECT COUNT(*) c FROM services WHERE service_date ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T' "
-            "AND (service_date::timestamptz AT TIME ZONE 'America/Chicago')::date=%s",
+            "WITH s AS (SELECT service_id, customer_id, vagaro_appt_id, "
+            "COALESCE(booking_status, '') AS status FROM services "
+            "WHERE service_date ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T' "
+            "AND (service_date::timestamptz AT TIME ZONE 'America/Chicago')::date=%s), "
+            "ref AS (SELECT DISTINCT ON (appt_id) appt_id, cust_ref FROM ("
+            "SELECT j->'payload'->>'appointmentId' AS appt_id, "
+            "j->'payload'->>'customerId' AS cust_ref, received_at FROM ("
+            "SELECT CASE WHEN pg_input_is_valid(payload_json, 'jsonb') THEN payload_json::jsonb END AS j, "
+            "received_at FROM webhook_events WHERE event_type='appointment') parsed) e "
+            "WHERE appt_id IN (SELECT vagaro_appt_id FROM s WHERE customer_id IS NULL) "
+            "ORDER BY appt_id, received_at DESC), "
+            "a AS (SELECT COALESCE(s.customer_id::text, ref.cust_ref, 'svc-' || s.service_id) AS visit, "
+            "s.status NOT IN ('Cancel', 'Deleted') AS active, s.status = 'Service Completed' AS done "
+            "FROM s LEFT JOIN ref ON ref.appt_id = s.vagaro_appt_id) "
+            "SELECT COUNT(*) FILTER (WHERE active) AS services, "
+            "COUNT(*) FILTER (WHERE active AND done) AS services_done, "
+            "COUNT(*) FILTER (WHERE NOT active) AS cancelled, "
+            "COUNT(DISTINCT visit) FILTER (WHERE active) AS total, "
+            "COUNT(DISTINCT visit) FILTER (WHERE active AND done) AS done "
+            "FROM a",
             (today_ct,),
-        ).fetchone()["c"]
+        ).fetchone()
         optouts_today = conn.execute(
             "SELECT COUNT(*) c FROM customers WHERE opt_out_date::date=%s", (today_ct,)
         ).fetchone()["c"]
@@ -368,6 +392,7 @@ def render_html(data: dict) -> str:
   .stat-label {{ font-size: 11px; color: var(--text-secondary); margin-bottom: 4px; }}
   .stat-value {{ font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; }}
   .stat-good {{ color: var(--good); }} .stat-bad {{ color: var(--bad); }}
+  .stat-sub {{ font-size: 11px; color: var(--text-secondary); margin-top: 2px; }}
   .section-title {{ font-size: 15px; font-weight: 700; margin: 30px 0 10px; }}
   table {{ width: 100%; border-collapse: collapse; font-size: 12.5px; }}
   th, td {{ text-align: right; padding: 6px 8px; border-bottom: 1px solid var(--grid); font-variant-numeric: tabular-nums; }}
@@ -437,7 +462,11 @@ def render_html(data: dict) -> str:
     <div class="stat-tile"><div class="stat-label">SMS (başarılı/başarısız)</div>
       <div class="stat-value"><span class="stat-good">{sms_ok}</span> / <span class="stat-bad">{sms_fail}</span></div></div>
     <div class="stat-tile"><div class="stat-label">Email Bugün</div><div class="stat-value">{data['email_today']}</div></div>
-    <div class="stat-tile"><div class="stat-label">Randevu Bugün</div><div class="stat-value">{data['appts_today']}</div></div>
+    <div class="stat-tile"><div class="stat-label">Randevu Bugün (gerçekleşen/toplam)</div>
+      <div class="stat-value"><span class="stat-good">{data['appts_today']['done']}</span> / {data['appts_today']['total']}</div></div>
+    <div class="stat-tile"><div class="stat-label">Hizmet Bugün (gerçekleşen/toplam)</div>
+      <div class="stat-value"><span class="stat-good">{data['appts_today']['services_done']}</span> / {data['appts_today']['services']}</div>
+      {f'<div class="stat-sub">{data["appts_today"]["cancelled"]} iptal/silinen hariç</div>' if data['appts_today']['cancelled'] else ''}</div>
     <div class="stat-tile"><div class="stat-label">Yeni Opt-out</div><div class="stat-value">{data['optouts_today']}</div></div>
     <div class="stat-tile"><div class="stat-label">Ortalama İşlem (Bugün)</div><div class="stat-value">${data['avg_ticket_today']:,.2f}</div></div>
     <div class="stat-tile"><div class="stat-label">Ay-üstü-Ay Büyüme</div><div class="stat-value">{fmt_mom(data['current_mom'])}</div></div>
