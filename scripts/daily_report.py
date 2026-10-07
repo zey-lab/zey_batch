@@ -27,6 +27,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 from dataclasses import asdict, dataclass
@@ -42,7 +43,10 @@ from sms_campaign.db import get_connection  # noqa: E402
 
 TZ = ZoneInfo("America/Chicago")
 CODEX_BIN = os.getenv("CODEX_BIN", "/opt/data/.local/bin/codex")
-MAX_ATTEMPTS = 3
+MAX_ATTEMPTS = 4
+# Hermes cron kills script jobs after an hour; stop starting new drafts well
+# before that so a slow day ends as "rejected" instead of being killed.
+TIME_BUDGET_SECONDS = 40 * 60
 MAX_ITEMS = 4
 
 TX_DAY = "(transaction_date::timestamptz AT TIME ZONE 'America/Chicago')::date"
@@ -122,14 +126,14 @@ def collect_facts(today: date) -> list[Fact]:
     if len(full) >= 2:
         last, prev = full[-1], full[-2]
         label = f"{month_name(last['month'])}, {month_name(prev['month'])} ayına göre"
-        for key, what in (("revenue", "ciro"), ("cust", "müşteri sayısı")):
+        for key, what in (("revenue", "ciro"), ("cust", "ödeme yapan müşteri sayısı")):
             v, d = change(last[key], prev[key])
             add(f"chg.month.{key}", f"{label} {what} değişimi", v, d)
     if len(full) >= 6:
         recent, earlier = full[-3:], full[-6:-3]
         r_label = f"{month_name(recent[0]['month'])}–{month_name(recent[-1]['month'])}"
         e_label = f"{month_name(earlier[0]['month'])}–{month_name(earlier[-1]['month'])}"
-        for key, what in (("revenue", "aylık ortalama ciro"), ("cust", "aylık ortalama müşteri sayısı")):
+        for key, what in (("revenue", "aylık ortalama ciro"), ("cust", "aylık ortalama ödeme yapan müşteri sayısı")):
             r_avg = sum(s[key] for s in recent) / 3
             e_avg = sum(s[key] for s in earlier) / 3
             fmt = money if key == "revenue" else (lambda v: f"{v:.0f}")
@@ -232,9 +236,22 @@ def collect_facts(today: date) -> list[Fact]:
         add("m30.sms_ok", f"{label} gönderilen SMS", sms["ok"], str(sms["ok"]))
         add("m30.sms_failed", f"{label} teslim edilemeyen SMS (failed/undelivered)", sms["failed"], str(sms["failed"]))
         add("m30.sms_failed_stop", f"{label} teslim edilemeyenlerden, daha önce STOP yazıp aboneliği bırakmış "
-            "numaralara gönderilmeye çalışılan SMS (Twilio engelliyor)", sms["stopped"], str(sms["stopped"]))
+            "numaralara gönderilmeye çalışılan SMS (Twilio engelliyor; bu müşteriler artık her sabah otomatik "
+            "olarak SMS listesinden çıkarılıyor)", sms["stopped"], str(sms["stopped"]))
         add("m30.sms_failed_stop_customers", f"{label} bu STOP engeline takılan farklı müşteri sayısı",
             sms["stopped_customers"], str(sms["stopped_customers"]))
+        # Current state, so the report doesn't ask for a clean-up that
+        # sync_sms_status.py already did this morning.
+        import sync_sms_status
+        still = len(sync_sms_status.stopped_customers())
+        add("sms.stop_still_listed", "Bugün itibarıyla STOP yazdığı halde hâlâ SMS listesinde görünen müşteri "
+            "(bunlar her sabah otomatik olarak listeden çıkarılır)", still, str(still))
+        undeliverable = conn.execute(
+            "SELECT COUNT(*) n FROM customers WHERE sms_undeliverable IS NOT NULL "
+            "AND COALESCE(sms_opt_out, 0) <> 1 AND active = 1").fetchone()["n"]
+        add("sms.undeliverable", "Numarası SMS alamadığı için (geçersiz, sabit hat, kullanılmıyor vb.) SMS gönderimi "
+            "otomatik durdurulan müşteri; numaraları Vagaro'da düzeltilmeli, liste panelde 'SMS Gitmeyen Numaralar' "
+            "bölümünde", undeliverable, str(undeliverable))
         other = sms["failed"] - sms["stopped"]
         add("m30.sms_failed_other", f"{label} teslim edilemeyenlerden geçersiz numara, operatör reddi veya "
             "izin verilmeyen bölge nedeniyle gitmeyen SMS", other, str(other))
@@ -362,7 +379,9 @@ items, most important first. Leave a list short or empty rather than padding it.
 
 Notes on the data: the salon is closed on some days (see the open_days facts), "Son 7 gün" and "Bu ay" can \
 cover the same days, and a customer counts as new in the period of their first payment. When no campaign has \
-the email channel turned on, sending no email is expected: email is an unused channel, not a failure.
+the email channel turned on, sending no email is expected: email is an unused channel, not a failure. STOP \
+opt-outs and undeliverable numbers are handled automatically every morning; don't ask the owner to do that \
+part -- the only manual step is correcting the numbers listed on the panel in Vagaro.
 
 Today is {today} (America/Chicago).
 
@@ -375,9 +394,11 @@ For every item (summary, good[i], watch[i]) check that:
 facts_used / summary_facts;
 - nothing is stated that the cited facts don't show (causes must be phrased as possibilities, e.g. "olabilir");
 - each watch item describes a problem or risk the cited facts actually show, not a neutral number;
-- the action follows from the item, is specific (what, for whom, by when) and is something the owner can \
-actually do -- "review" or "monitor" alone is not an action.
-Ignore style and wording preferences. Set ok to false only for real problems, and name the item in each problem.
+- the action is specific (what, for whom, by when) and addresses the item -- "review" or "monitor" alone is \
+not an action. Actions are recommendations: they need to fit the facts, not to be proven by them.
+Ignore style, wording and synonyms that keep the meaning (e.g. "müşteri" for "ödeme yapan müşteri"). Set ok to \
+false only for a wrong number, a wrong direction or comparison, a claim the facts don't support, or a vague \
+action, and name the item in each problem.
 Answer with the JSON object only, in exactly this shape (each problem is one plain sentence). Don't run commands \
 or read files.
 {{"ok": true, "problems": ["<item>: <problem>", ...]}}
@@ -511,7 +532,11 @@ def write_report(facts: list[Fact], today: date, llm=ask_llm) -> tuple[dict | No
     prompt = WRITER_PROMPT.format(max_items=MAX_ITEMS, today=today.isoformat(), facts=facts_json(facts))
     attempts: list[dict] = []
     feedback: list[str] = []
+    started = time.monotonic()
     for _ in range(MAX_ATTEMPTS):
+        if attempts and time.monotonic() - started > TIME_BUDGET_SECONDS:
+            attempts.append({"error": f"stopped: over the {TIME_BUDGET_SECONDS // 60} minute budget"})
+            break
         full_prompt = prompt
         if feedback:
             full_prompt += ("\n\nYour previous answer was rejected for these reasons. Fix them:\n- "
@@ -586,6 +611,10 @@ def main() -> int:
     facts = collect_facts(today)
     report, attempts = write_report(facts, today)
     status = "published" if report else "rejected"
+    for i, a in enumerate(attempts, 1):  # into the cron log, even when nothing is stored
+        problems = a.get("error") or a.get("verify_problems") or (a.get("judge") or {}).get("problems")
+        if problems:
+            print(f"attempt {i} rejected: {problems}", file=sys.stderr)
     if args.dry_run:
         print(json.dumps({"facts": [asdict(f) for f in facts], "status": status, "report": report,
                           "attempts": attempts}, ensure_ascii=False, indent=1))
