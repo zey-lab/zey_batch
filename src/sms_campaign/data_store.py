@@ -66,7 +66,7 @@ class ZeyDataStore:
         conn = self._conn()
         try:
             existing = conn.execute(
-                "SELECT customer_id FROM customers WHERE enc_user_id=%s", (enc_id,)
+                "SELECT customer_id, mobile FROM customers WHERE enc_user_id=%s", (enc_id,)
             ).fetchone()
 
             if action == "deleted":
@@ -99,6 +99,9 @@ class ZeyDataStore:
                 set_fields = {k: v for k, v in fields.items() if v is not None}
                 if mobile:
                     set_fields["mobile"] = mobile
+                if mobile and mobile != existing["mobile"]:
+                    # A corrected number gets SMS again (see sync_sms_status.py).
+                    set_fields["sms_undeliverable"] = None
                 if not set_fields:
                     return {"status": "noop", "customer_id": existing["customer_id"]}
                 set_fields["customer_id"] = existing["customer_id"]

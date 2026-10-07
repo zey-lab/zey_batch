@@ -89,6 +89,10 @@ class SQLiteCampaignRunner:
         customers = self.store.get_active_customers()
         if customers.empty:
             return customers
+        # Numbers Twilio can't deliver to (scripts/sync_sms_status.py) are
+        # skipped until the number is corrected in Vagaro.
+        if "sms_undeliverable" in customers.columns:
+            customers = customers[customers["sms_undeliverable"].isna()].copy()
 
         sms_history = self.store.export_table("sms_history")
         if sms_history.empty:
@@ -181,6 +185,11 @@ class SQLiteCampaignRunner:
                 sent += 1
             else:
                 failed += 1
+                # Twilio 21610: the number replied STOP and Twilio will refuse
+                # every later send too -- record the opt-out instead of
+                # retrying this customer in every campaign.
+                if error and "unsubscribed recipient" in error:
+                    self.store.set_opt_out(row["mobile"])
         self.store.update_campaign_status(campaign_id, "completed")
         return CampaignRunResult(
             dry_run=False, campaign_id=campaign_id, campaign_type=str(campaign.campaign_type),

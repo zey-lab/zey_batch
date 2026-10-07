@@ -63,6 +63,32 @@ class TestSQLiteCampaignRunner(unittest.TestCase):
             self.assertEqual(history.iloc[0]["twilio_sid"], "SM-123")
             self.assertEqual(history.iloc[0]["status"], "delivered")
 
+    def test_stop_refusal_from_twilio_opts_the_customer_out(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            store = self._store(temp_dir)
+            sender = Mock()
+            sender.dry_run = False
+            sender.last_message_sid = None
+            sender.send_sms.return_value = (
+                False, "failed", "Twilio error: Unable to create record: Attempt to send to unsubscribed recipient")
+            runner = SQLiteCampaignRunner(store, sender, test_phones=["5550000001"])
+            result = runner.run_campaign(runner.pending_campaigns()[0], campaign_id=1)
+
+            self.assertEqual(result.failed_count, 1)
+            customers = store.export_table("customers").set_index("mobile")
+            self.assertEqual(customers.loc["+15550000001", "sms_opt_out"], 1)
+
+    def test_customer_with_an_undeliverable_number_is_skipped(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            store = self._store(temp_dir)
+            conn = get_connection()
+            conn.execute("UPDATE customers SET sms_undeliverable='geçersiz numara' WHERE mobile='+15550000001'")
+            conn.commit()
+            conn.close()
+            runner = SQLiteCampaignRunner(store, SMSSender("", "", "", dry_run=True))
+            result = runner.run_campaign(runner.pending_campaigns()[0], campaign_id=1)
+            self.assertEqual(result.eligible_count, 0)
+
     def test_unapproved_campaign_is_never_pending_regardless_of_type(self) -> None:
         """Regression test for the 2026-09-14 incident: a non-Announce
         campaign (type=Campaign) with approved=0 must never be eligible,

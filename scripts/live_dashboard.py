@@ -265,6 +265,19 @@ def fetch_dashboard_data() -> dict:
                 ).fetchone()
         except psycopg.Error:
             ai_row = None
+
+        # Numbers Twilio can't deliver to (scripts/sync_sms_status.py), to be
+        # corrected in Vagaro.
+        try:
+            with conn.transaction():
+                undeliverable = conn.execute(
+                    "SELECT COALESCE(NULLIF(TRIM(CONCAT_WS(' ', first_name, last_name)), ''), '—') AS name, "
+                    "mobile, sms_undeliverable AS reason FROM customers "
+                    "WHERE sms_undeliverable IS NOT NULL AND COALESCE(sms_opt_out, 0) <> 1 AND active = 1 "
+                    "ORDER BY name"
+                ).fetchall()
+        except psycopg.Error:
+            undeliverable = []
     finally:
         conn.close()
 
@@ -323,6 +336,7 @@ def fetch_dashboard_data() -> dict:
         "lapsed": [dict(r) for r in lapsed],
         "insights": insights,
         "ai_report": ai_report,
+        "undeliverable": [dict(r) for r in undeliverable],
     }
 
 
@@ -336,6 +350,11 @@ def render_html(data: dict) -> str:
         f"<tr><td>{html.escape(str(r['campaign_type']))}</td><td>{html.escape(str(r['status']))}</td>"
         f"<td>{r['c']}</td></tr>"
         for r in data["sms_rows"]
+    )
+    undeliverable_rows = "".join(
+        f"<tr><td>{html.escape(r['name'])}</td><td>{html.escape(r['mobile'] or '—')}</td>"
+        f"<td>{html.escape(r['reason'])}</td></tr>"
+        for r in data["undeliverable"]
     )
     txn_rows_html = "".join(
         f"<tr><td>{html.escape(str(r['customer_name'] or '—'))}</td>"
@@ -544,6 +563,13 @@ def render_html(data: dict) -> str:
   <p class="section-title">SMS Kırılımı (Bugün)</p>
   <div class="table-wrap"><table><thead><tr><th>Tip</th><th>Durum</th><th>Adet</th></tr></thead>
   <tbody>{sms_breakdown or '<tr><td colspan="3">Henüz gönderim yok</td></tr>'}</tbody></table></div>
+
+  <details class="collapsible">
+    <summary class="section-title">SMS Gitmeyen Numaralar ({len(data['undeliverable'])})</summary>
+    <p class="panel-sub">Twilio bu numaralara SMS iletemiyor, kampanyalar bu müşterileri atlıyor. Numarayı Vagaro'da düzeltince müşteri otomatik olarak tekrar SMS almaya başlar.</p>
+    <div class="table-wrap"><table><thead><tr><th>Müşteri</th><th>Telefon</th><th>Neden</th></tr></thead>
+    <tbody>{undeliverable_rows or '<tr><td colspan="3">Yok</td></tr>'}</tbody></table></div>
+  </details>
 
   <p class="section-title">En Yüksek Ciro Yapan 3 Gün (Tüm Zamanlar)</p>
   <div class="top-days">{top_days_html}</div>

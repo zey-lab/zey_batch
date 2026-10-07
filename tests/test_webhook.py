@@ -337,6 +337,32 @@ class TestWebhookProcessor(unittest.TestCase):
             self.assertEqual(txn["customer_id"], customer_id)
             self.assertEqual(txn["customer_name"], "Lena Park")
 
+    def test_corrected_number_from_vagaro_clears_the_undeliverable_flag(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            processor = WebhookProcessor(Path(temp_dir) / "zey.sqlite3", "secret")
+
+            def customer_event(event_id: str, action: str, phone: str) -> None:
+                processor.process({"Authorization": "Bearer secret"}, json.dumps({
+                    "id": event_id, "type": "customer", "action": action,
+                    "payload": {"customerId": "enc-fix", "customerFirstName": "Ida", "mobilePhone": phone},
+                }).encode())
+
+            def flag() -> str | None:
+                conn = get_connection()
+                row = conn.execute("SELECT sms_undeliverable FROM customers WHERE enc_user_id='enc-fix'").fetchone()
+                conn.close()
+                return row["sms_undeliverable"]
+
+            customer_event("evt-fix-1", "created", "5550001111")
+            conn = get_connection()
+            conn.execute("UPDATE customers SET sms_undeliverable='geçersiz numara' WHERE enc_user_id='enc-fix'")
+            conn.commit()
+            conn.close()
+            customer_event("evt-fix-2", "updated", "5550001111")
+            self.assertEqual(flag(), "geçersiz numara")  # same number: still undeliverable
+            customer_event("evt-fix-3", "updated", "5550002222")
+            self.assertIsNone(flag())
+
     def test_relink_skips_a_stored_payload_postgres_cannot_parse(self) -> None:
         """One unparseable stored payload must not break relinking (or the
         panel query sharing the same pattern) for every other row."""
