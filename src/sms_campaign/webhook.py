@@ -125,8 +125,18 @@ class WebhookProcessor:
         except Exception:
             logger.exception("Vagaro API customer lookup failed for %s", vagaro_customer_id)
             return
-        if data:
-            self.store.sync_customer_from_webhook(data, "created")
+        if data and self.store.sync_customer_from_webhook(data, "created").get("status") == "created":
+            self._relink_orphans()
+
+    def _relink_orphans(self) -> dict | None:
+        """Best-effort: attach earlier customer-less services/transactions to
+        a customer that now exists. Never raises -- the customer itself is
+        already saved, and a relink failure must not fail the event."""
+        try:
+            return self.store.relink_orphans()
+        except Exception:
+            logger.exception("Relinking orphan services/transactions failed")
+            return None
 
     def _ingest(self, event_type: str, payload: dict, action: str = "") -> dict[str, object]:
         if event_type == "transaction":
@@ -188,6 +198,11 @@ class WebhookProcessor:
                 "Date": payload.get("startTime"),
                 "Amount": payload.get("amount"),
                 "Duration": self._minutes_between(payload.get("startTime"), payload.get("endTime")),
+                # Vagaro's own lifecycle: Confirmed/Accepted -> Show ->
+                # Service Completed, or Cancel; a 'deleted' event carries
+                # "Deleted". Kept on the row instead of deleting it, so
+                # reports can exclude cancelled/deleted appointments.
+                "BookingStatus": payload.get("bookingStatus") or ("Deleted" if action == "deleted" else None),
             }
             result = self.store.sync_services(pd.DataFrame([row]))
             return {"derived_table": "services", "inserted": result.inserted, "updated": result.updated}
@@ -210,6 +225,8 @@ class WebhookProcessor:
             # Scoped to exactly this one customer_id -- cannot affect any
             # other row, unlike the bulk report import this replaces.
             result = self.store.sync_customer_from_webhook(payload, action)
+            if result.get("status") in ("created", "updated"):
+                result["relinked"] = self._relink_orphans()
             return {"derived_table": "customers", **result}
 
         return {"derived_table": "webhook_events", "status": "unsupported_event_type"}

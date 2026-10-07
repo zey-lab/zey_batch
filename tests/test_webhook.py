@@ -254,6 +254,103 @@ class TestWebhookProcessor(unittest.TestCase):
             self.assertEqual(rows["enc-1"], 0)
             self.assertEqual(rows["enc-2"], 1)  # the other customer is untouched
 
+    def test_appointment_booking_status_is_kept_and_deleted_is_marked_not_removed(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            processor = WebhookProcessor(Path(temp_dir) / "zey.sqlite3", "secret")
+            appointment = {
+                "appointmentId": "appt-1", "customerId": "enc-1", "serviceTitle": "Brow Shaping",
+                "startTime": "2026-10-06T21:00:00Z", "endTime": "2026-10-06T21:15:00Z",
+                "amount": 30.0, "bookingStatus": "Confirmed",
+            }
+
+            def send(event_id: str, action: str, **changes: object) -> None:
+                processor.process(
+                    {"Authorization": "Bearer secret"},
+                    json.dumps({
+                        "id": event_id, "type": "appointment", "action": action,
+                        "payload": {**appointment, **changes},
+                    }).encode(),
+                )
+
+            def status() -> str | None:
+                conn = get_connection()
+                row = conn.execute(
+                    "SELECT booking_status FROM services WHERE vagaro_appt_id='appt-1'"
+                ).fetchone()
+                conn.close()
+                return row["booking_status"]
+
+            send("evt-appt-1", "created")
+            self.assertEqual(status(), "Confirmed")
+            send("evt-appt-2", "updated", bookingStatus="Service Completed")
+            self.assertEqual(status(), "Service Completed")
+            send("evt-appt-3", "deleted", bookingStatus=None)
+            self.assertEqual(status(), "Deleted")
+
+    def test_customer_webhook_relinks_appointment_and_transaction_saved_before_it(self) -> None:
+        """Regression test for the 2026-10-07 finding: an appointment and
+        checkout that arrive before their customer exists were left with
+        no customer forever, even after the customer record was created."""
+        with TemporaryDirectory() as temp_dir:
+            processor = WebhookProcessor(Path(temp_dir) / "zey.sqlite3", "secret")
+            headers = {"Authorization": "Bearer secret"}
+            processor.process(headers, json.dumps({
+                "id": "evt-orphan-appt", "type": "appointment", "action": "created",
+                "payload": {
+                    "appointmentId": "appt-orphan", "customerId": "enc-late",
+                    "serviceTitle": "Threading - Lips", "startTime": "2026-10-06T21:15:00Z",
+                    "endTime": "2026-10-06T21:25:00Z", "amount": 10.0,
+                    "bookingStatus": "Service Completed",
+                },
+            }).encode())
+            processor.process(headers, json.dumps({
+                "id": "evt-orphan-txn", "type": "transaction", "action": "created",
+                "payload": {
+                    "transactionId": "txn-orphan", "userPaymentId": "pay-orphan",
+                    "transactionDate": "2026-10-06T21:37:00Z", "customerId": "enc-late",
+                    "itemSold": "Threading - Lips", "ccAmount": 12.0,
+                },
+            }).encode())
+
+            conn = get_connection()
+            self.assertIsNone(conn.execute("SELECT customer_id FROM services").fetchone()["customer_id"])
+            self.assertIsNone(conn.execute("SELECT customer_id FROM transactions").fetchone()["customer_id"])
+            conn.close()
+
+            result = processor.process(headers, json.dumps({
+                "id": "evt-late-customer", "type": "customer", "action": "created",
+                "payload": {
+                    "customerId": "enc-late", "customerFirstName": "Lena",
+                    "customerLastName": "Park", "mobilePhone": "5550004444",
+                },
+            }).encode())
+            self.assertEqual(result["relinked"], {"services": 1, "transactions": 1})
+
+            conn = get_connection()
+            customer_id = conn.execute(
+                "SELECT customer_id FROM customers WHERE enc_user_id='enc-late'"
+            ).fetchone()["customer_id"]
+            service = conn.execute("SELECT customer_id FROM services").fetchone()
+            txn = conn.execute("SELECT customer_id, customer_name FROM transactions").fetchone()
+            conn.close()
+            self.assertEqual(service["customer_id"], customer_id)
+            self.assertEqual(txn["customer_id"], customer_id)
+            self.assertEqual(txn["customer_name"], "Lena Park")
+
+    def test_relink_skips_a_stored_payload_postgres_cannot_parse(self) -> None:
+        """One unparseable stored payload must not break relinking (or the
+        panel query sharing the same pattern) for every other row."""
+        with TemporaryDirectory() as temp_dir:
+            processor = WebhookProcessor(Path(temp_dir) / "zey.sqlite3", "secret")
+            conn = get_connection()
+            conn.execute(
+                "INSERT INTO webhook_events (event_id, event_type, action, payload_json) "
+                "VALUES ('evt-bad', 'appointment', 'created', '{\"payload\": {\"amount\": NaN}}')"
+            )
+            conn.commit()
+            conn.close()
+            self.assertEqual(processor.store.relink_orphans(), {"services": 0, "transactions": 0})
+
 
 if __name__ == "__main__":
     unittest.main()

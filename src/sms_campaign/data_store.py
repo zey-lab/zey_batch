@@ -385,6 +385,59 @@ class ZeyDataStore:
         finally:
             conn.close()
 
+    def relink_orphans(self) -> dict:
+        """Attach services/transactions saved with no customer to the
+        customer they reference, now that the customer exists.
+
+        Found 2026-10-07: an appointment/transaction ingested before its
+        customer record existed (customer created later by a 'customer'
+        webhook or a backfill) stayed customer_id NULL forever, because
+        nothing ever looked at it again. Services carry no customer ref
+        themselves, so it is taken from the latest appointment webhook for
+        that appointment; transactions keep it in raw_json. Only rows that
+        are still NULL are touched, so this is safe to run any time.
+        """
+        conn = self._conn()
+        try:
+            # The CASE guard skips a stored payload Postgres can't parse
+            # (e.g. a NaN Python's json accepted) instead of failing the
+            # whole statement; CASE fixes evaluation order, a WHERE would not.
+            services = conn.execute(
+                """UPDATE services s SET customer_id = c.customer_id
+                   FROM (
+                       SELECT DISTINCT ON (appt_id) appt_id, ref FROM (
+                           SELECT j->'payload'->>'appointmentId' AS appt_id,
+                                  j->'payload'->>'customerId' AS ref,
+                                  received_at
+                           FROM (
+                               SELECT CASE WHEN pg_input_is_valid(payload_json, 'jsonb')
+                                           THEN payload_json::jsonb END AS j,
+                                      received_at
+                               FROM webhook_events WHERE event_type='appointment'
+                           ) parsed
+                       ) e
+                       WHERE appt_id IS NOT NULL
+                       ORDER BY appt_id, received_at DESC
+                   ) w
+                   JOIN customers c ON c.enc_user_id = w.ref OR c.vagaro_user_id = w.ref
+                   WHERE s.customer_id IS NULL AND s.vagaro_appt_id = w.appt_id"""
+            ).rowcount
+            # Bulk-report rows store CustomerID as a bare number, webhook rows
+            # as a quoted encrypted id -- the pattern accepts both.
+            transactions = conn.execute(
+                """UPDATE transactions t SET customer_id = c.customer_id,
+                       customer_name = COALESCE(t.customer_name,
+                           NULLIF(TRIM(CONCAT_WS(' ', c.first_name, c.last_name)), ''))
+                   FROM customers c
+                   WHERE t.customer_id IS NULL
+                     AND substring(t.raw_json from '"CustomerID": "?([^",}]+)') IN
+                         (c.enc_user_id, c.vagaro_user_id)"""
+            ).rowcount
+            conn.commit()
+            return {"services": services, "transactions": transactions}
+        finally:
+            conn.close()
+
     # ── Services ───────────────────────────────────────────────
 
     def sync_services(self, df: pd.DataFrame) -> SyncResult:
@@ -433,6 +486,7 @@ class ZeyDataStore:
                     "amount_paid": self._float(row.get("Amount", row.get("Total"))),
                     "notes": self._str(row.get("Notes")),
                     "vagaro_appt_id": vagaro_appt_id,
+                    "booking_status": self._str(row.get("BookingStatus")),
                 }
 
                 existing = conn.execute(
@@ -441,11 +495,15 @@ class ZeyDataStore:
                 ).fetchone()
 
                 if existing:
+                    # COALESCE: a source that can't resolve the customer or
+                    # doesn't carry a booking status (bulk imports) must not
+                    # erase a link/status an earlier event already set.
                     conn.execute(
-                        """UPDATE services SET customer_id=%(customer_id)s,
+                        """UPDATE services SET customer_id=COALESCE(%(customer_id)s, customer_id),
                             employee_name=%(employee_name)s, service_name=%(service_name)s,
                             service_date=%(service_date)s, duration_min=%(duration_min)s,
-                            amount_paid=%(amount_paid)s, notes=%(notes)s
+                            amount_paid=%(amount_paid)s, notes=%(notes)s,
+                            booking_status=COALESCE(%(booking_status)s, booking_status)
                         WHERE vagaro_appt_id=%(vagaro_appt_id)s""",
                         data,
                     )
@@ -454,10 +512,11 @@ class ZeyDataStore:
                     conn.execute(
                         """INSERT INTO services
                             (customer_id, employee_name, service_name, service_date,
-                             duration_min, amount_paid, notes, vagaro_appt_id)
+                             duration_min, amount_paid, notes, vagaro_appt_id, booking_status)
                         VALUES
                             (%(customer_id)s, %(employee_name)s, %(service_name)s, %(service_date)s,
-                             %(duration_min)s, %(amount_paid)s, %(notes)s, %(vagaro_appt_id)s)""",
+                             %(duration_min)s, %(amount_paid)s, %(notes)s, %(vagaro_appt_id)s,
+                             %(booking_status)s)""",
                         data,
                     )
                     result.inserted += 1
