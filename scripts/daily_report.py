@@ -6,14 +6,15 @@ Runs once a day (Hermes cron, 06:00 America/Chicago):
 
 1. collect_facts() computes every number the report may use from Supabase.
    The model never sees raw rows and is told not to do arithmetic.
-2. The model (Codex CLI on the ChatGPT subscription) writes the report as
-   JSON; every item lists the ids of the facts it relies on.
+2. The zeybrow Hermes agent (its OpenAI-compatible API server) writes the
+   report as JSON; every item lists the ids of the facts it relies on. The
+   Codex CLI is the fallback when the agent can't be reached.
 3. verify_report() is deterministic: cited facts must exist and every number
    in the text must appear in a cited fact's display value or label.
 4. A second model call (the judge) checks directions, comparisons and claims
    against the cited facts.
-5. Failed checks are fed back for one more attempt. If that also fails the
-   day is stored as rejected and the panel keeps showing the last published
+5. Failed checks are fed back, up to MAX_ATTEMPTS drafts. If all fail the day
+   is stored as rejected and the panel keeps showing the last published
    report, or the rule-based insights when there is none.
 """
 
@@ -26,6 +27,8 @@ import re
 import subprocess
 import sys
 import tempfile
+import urllib.error
+import urllib.request
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -208,13 +211,16 @@ def collect_facts(today: date) -> list[Fact]:
             str(v["open"] + v["completed"]))
         add("next7.services", f"Önümüzdeki 7 gün ({span(*ahead)}) alınmış hizmet", v["services"], str(v["services"]))
 
-        # SMS, last 30 days. Email is left out: no email campaign is set up, so
-        # "0 emails" would be reported as a problem every day.
+        # SMS and email, last 30 days.
         m30 = (today - timedelta(days=30), yesterday)
         label = f"Son 30 gün ({span(*m30)})"
         sms = conn.execute(
             "SELECT COUNT(*) FILTER (WHERE status IN ('sent', 'delivered')) ok, "
-            "COUNT(*) FILTER (WHERE status IN ('failed', 'undelivered')) failed FROM sms_history "
+            "COUNT(*) FILTER (WHERE status IN ('failed', 'undelivered')) failed, "
+            # Twilio 21610: the number replied STOP, so Twilio refuses to send.
+            "COUNT(*) FILTER (WHERE error_message LIKE '%%unsubscribed recipient%%') stopped, "
+            "COUNT(DISTINCT customer_id) FILTER (WHERE error_message LIKE '%%unsubscribed recipient%%') "
+            "stopped_customers FROM sms_history "
             "WHERE (sent_at::timestamptz AT TIME ZONE 'America/Chicago')::date BETWEEN %s AND %s", m30).fetchone()
         # Bulk imports stamp many customers with one identical opt_out_date
         # (2026-09-16: 132 at once); only individual opt-outs say anything
@@ -225,8 +231,22 @@ def collect_facts(today: date) -> list[Fact]:
             "SELECT opt_out_date FROM customers GROUP BY 1 HAVING COUNT(*) <= 5)", m30).fetchone()["n"]
         add("m30.sms_ok", f"{label} gönderilen SMS", sms["ok"], str(sms["ok"]))
         add("m30.sms_failed", f"{label} teslim edilemeyen SMS (failed/undelivered)", sms["failed"], str(sms["failed"]))
+        add("m30.sms_failed_stop", f"{label} teslim edilemeyenlerden, daha önce STOP yazıp aboneliği bırakmış "
+            "numaralara gönderilmeye çalışılan SMS (Twilio engelliyor)", sms["stopped"], str(sms["stopped"]))
+        add("m30.sms_failed_stop_customers", f"{label} bu STOP engeline takılan farklı müşteri sayısı",
+            sms["stopped_customers"], str(sms["stopped_customers"]))
+        other = sms["failed"] - sms["stopped"]
+        add("m30.sms_failed_other", f"{label} teslim edilemeyenlerden geçersiz numara, operatör reddi veya "
+            "izin verilmeyen bölge nedeniyle gitmeyen SMS", other, str(other))
         add("m30.optouts", f"{label} SMS listesinden kendisi çıkan müşteri (toplu içe aktarımlar hariç)",
             optouts, str(optouts))
+        emails = conn.execute(
+            "SELECT COUNT(*) n FROM email_history "
+            "WHERE (sent_at::timestamptz AT TIME ZONE 'America/Chicago')::date BETWEEN %s AND %s", m30).fetchone()["n"]
+        email_campaigns = conn.execute(
+            "SELECT COUNT(*) n FROM campaigns WHERE active = 1 AND channels ILIKE '%%email%%'").fetchone()["n"]
+        add("m30.emails", f"{label} gönderilen email", emails, str(emails))
+        add("email.campaigns", "Email kanalı açık aktif kampanya sayısı", email_campaigns, str(email_campaigns))
     finally:
         conn.close()
 
@@ -330,14 +350,19 @@ its "label" (dates, "7 gün").
 possibilities ("olabilir"), never as facts.
 5. Each action says what to do, for whom and by when, and follows from the item's facts. Say "by when" in \
 words (bugün, bu hafta, bu ay), never as a date. "Review", "monitor" or "keep an eye on" is not an action.
-6. watch is only for problems or risks the facts actually show. A neutral number, such as how many \
-appointments are booked, belongs in neither list unless the facts show it is good or bad.
+6. good items only say what is going well; actions belong in watch. watch is only for problems or risks the \
+facts actually show. A neutral number, such as how many appointments are booked, belongs in neither list \
+unless the facts show it is good or bad.
 7. summary: 2-3 sentences on the overall picture. good: at most {max_items} items. watch: at most {max_items} \
 items, most important first. Leave a list short or empty rather than padding it.
-8. Answer with the JSON object only. Don't run commands or read files.
+8. Answer with the JSON object only, in exactly this shape. Don't run commands or read files.
+{{"summary": "...", "summary_facts": ["<fact id>", ...],
+ "good": [{{"text": "...", "facts_used": ["<fact id>", ...]}}],
+ "watch": [{{"issue": "...", "why": "...", "action": "...", "facts_used": ["<fact id>", ...]}}]}}
 
 Notes on the data: the salon is closed on some days (see the open_days facts), "Son 7 gün" and "Bu ay" can \
-cover the same days, and a customer counts as new in the period of their first payment.
+cover the same days, and a customer counts as new in the period of their first payment. When no campaign has \
+the email channel turned on, sending no email is expected: email is an unused channel, not a failure.
 
 Today is {today} (America/Chicago).
 
@@ -353,7 +378,9 @@ facts_used / summary_facts;
 - the action follows from the item, is specific (what, for whom, by when) and is something the owner can \
 actually do -- "review" or "monitor" alone is not an action.
 Ignore style and wording preferences. Set ok to false only for real problems, and name the item in each problem.
-Answer with the JSON object only. Don't run commands or read files.
+Answer with the JSON object only, in exactly this shape (each problem is one plain sentence). Don't run commands \
+or read files.
+{{"ok": true, "problems": ["<item>: <problem>", ...]}}
 
 Facts:
 {facts}
@@ -364,6 +391,95 @@ Report:
 
 class LLMError(RuntimeError):
     pass
+
+
+# Leading tag the zeybrow Multica tracking hook (/opt/data/hooks/multica-track.sh)
+# skips, so the daily report's calls are not filed as owner requests.
+REQUEST_TAG = "[ZEYBROW-DAILY-REPORT]"
+HERMES_URL = os.getenv("HERMES_API_URL", "http://127.0.0.1:8642/v1/chat/completions")
+BACKENDS_USED: list[str] = []
+
+
+def check_shape(value, schema: dict, where: str = "answer") -> None:
+    """Minimal JSON-schema check for the two schemas above -- the agent's
+    API doesn't guarantee schema-valid output the way Codex's flag does."""
+    kind = schema["type"]
+    expected = {"object": dict, "array": list, "string": str, "boolean": bool, "integer": int}[kind]
+    if not isinstance(value, expected) or (kind == "integer" and isinstance(value, bool)):
+        raise LLMError(f"{where} should be {kind}, got {type(value).__name__}")
+    if kind == "object":
+        missing = [k for k in schema["required"] if k not in value]
+        if missing:
+            raise LLMError(f"{where} is missing {missing}")
+        for key, sub in schema["properties"].items():
+            check_shape(value[key], sub, f"{where}.{key}")
+    elif kind == "array":
+        for i, item in enumerate(value):
+            check_shape(item, schema["items"], f"{where}[{i}]")
+
+
+def parse_json_answer(text: str) -> dict:
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.strip("`").removeprefix("json").strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        start, end = text.find("{"), text.rfind("}")
+        if start == -1 or end <= start:
+            raise LLMError(f"no JSON object in the answer: {text[:200]!r}") from None
+        try:
+            return json.loads(text[start:end + 1])
+        except json.JSONDecodeError as exc:
+            raise LLMError(f"answer is not valid JSON: {exc}") from exc
+
+
+def hermes_api_key() -> str:
+    key = os.getenv("HERMES_API_KEY", "")
+    if not key:
+        env_file = Path("/opt/data/.env")
+        if env_file.exists():
+            for line in env_file.read_text().splitlines():
+                if line.startswith("API_SERVER_KEY="):
+                    key = line.split("=", 1)[1].strip().strip('"')
+    if not key:
+        raise LLMError("no Hermes API key (HERMES_API_KEY or API_SERVER_KEY in /opt/data/.env)")
+    return key
+
+
+def run_hermes(prompt: str, schema: dict, timeout: int = 600) -> dict:
+    body = json.dumps({
+        "model": "hermes-agent",
+        "messages": [{"role": "user", "content": f"{REQUEST_TAG}\n{prompt}"}],
+        "response_format": {"type": "json_schema",
+                            "json_schema": {"name": "answer", "strict": True, "schema": schema}},
+    }).encode()
+    request = urllib.request.Request(HERMES_URL, data=body, method="POST", headers={
+        "Authorization": f"Bearer {hermes_api_key()}", "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            reply = json.load(response)
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        raise LLMError(f"Hermes API call failed: {exc}") from exc
+    try:
+        answer = parse_json_answer(reply["choices"][0]["message"]["content"] or "")
+    except (KeyError, IndexError, TypeError) as exc:
+        raise LLMError(f"unexpected Hermes API reply: {str(reply)[:200]}") from exc
+    check_shape(answer, schema)
+    return answer
+
+
+def ask_llm(prompt: str, schema: dict) -> dict:
+    """The zeybrow Hermes agent; the Codex CLI only if the agent fails."""
+    try:
+        answer = run_hermes(prompt, schema)
+        BACKENDS_USED.append("hermes-agent")
+        return answer
+    except LLMError as hermes_error:
+        print(f"Hermes agent failed, falling back to Codex: {hermes_error}", file=sys.stderr)
+    answer = run_codex(prompt, schema)
+    BACKENDS_USED.append("codex-cli")
+    return answer
 
 
 def run_codex(prompt: str, schema: dict, timeout: int = 600) -> dict:
@@ -390,7 +506,7 @@ def facts_json(facts: list[Fact]) -> str:
                       ensure_ascii=False, indent=1)
 
 
-def write_report(facts: list[Fact], today: date, llm=run_codex) -> tuple[dict | None, list[dict]]:
+def write_report(facts: list[Fact], today: date, llm=ask_llm) -> tuple[dict | None, list[dict]]:
     """Returns (published report or None, one record per attempt)."""
     prompt = WRITER_PROMPT.format(max_items=MAX_ITEMS, today=today.isoformat(), facts=facts_json(facts))
     attempts: list[dict] = []
@@ -438,7 +554,7 @@ def store(report_date: date, status: str, facts: list[Fact], report: dict | None
                  attempts = EXCLUDED.attempts, facts_json = EXCLUDED.facts_json,
                  report_json = EXCLUDED.report_json, checks_json = EXCLUDED.checks_json
                WHERE daily_reports.status <> 'published' OR EXCLUDED.status = 'published'""",
-            (report_date, status, "codex-cli", len(attempts),
+            (report_date, status, ",".join(sorted(set(BACKENDS_USED))) or None, len(attempts),
              json.dumps([asdict(f) for f in facts], ensure_ascii=False),
              json.dumps(report, ensure_ascii=False) if report else None,
              json.dumps(attempts, ensure_ascii=False)),

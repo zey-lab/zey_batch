@@ -4,6 +4,7 @@ import sys
 import unittest
 from datetime import date
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
@@ -74,6 +75,31 @@ class TestWriteReport(unittest.TestCase):
         self.assertIsNone(published)
         self.assertEqual(len(attempts), daily_report.MAX_ATTEMPTS)
         self.assertIn("revenue rose", calls[2])
+
+
+class TestAgentAnswerHandling(unittest.TestCase):
+    def test_json_is_taken_from_fenced_or_chatty_answers(self) -> None:
+        self.assertEqual(daily_report.parse_json_answer('```json\n{"ok": true}\n```'), {"ok": True})
+        self.assertEqual(daily_report.parse_json_answer('Here it is: {"ok": true} Done.'), {"ok": True})
+        with self.assertRaises(daily_report.LLMError):
+            daily_report.parse_json_answer("I could not do that.")
+
+    def test_answer_missing_a_required_field_is_rejected(self) -> None:
+        daily_report.check_shape(report(), daily_report.REPORT_SCHEMA)
+        broken = report()
+        del broken["watch"][0]["action"]
+        with self.assertRaisesRegex(daily_report.LLMError, r"watch\[0\] is missing \['action'\]"):
+            daily_report.check_shape(broken, daily_report.REPORT_SCHEMA)
+
+    def test_codex_is_used_only_when_the_agent_fails(self) -> None:
+        def agent_down(prompt: str, schema: dict) -> dict:
+            raise daily_report.LLMError("connection refused")
+
+        with patch.object(daily_report, "run_hermes", agent_down), \
+                patch.object(daily_report, "run_codex", lambda prompt, schema: {"ok": True, "problems": []}), \
+                patch.object(daily_report, "BACKENDS_USED", []):
+            self.assertEqual(daily_report.ask_llm("p", daily_report.JUDGE_SCHEMA), {"ok": True, "problems": []})
+            self.assertEqual(daily_report.BACKENDS_USED, ["codex-cli"])
 
 
 if __name__ == "__main__":
