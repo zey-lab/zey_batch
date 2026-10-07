@@ -24,6 +24,8 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+import psycopg  # noqa: E402
+
 from sms_campaign.db import get_connection  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -249,8 +251,30 @@ def fetch_dashboard_data() -> dict:
         active_staff = conn.execute(
             "SELECT COUNT(DISTINCT name) c FROM employees WHERE active = 1"
         ).fetchone()["c"]
+
+        # Latest verified LLM report from scripts/daily_report.py; the
+        # rule-based insights stay the fallback when there is none. A savepoint
+        # keeps a missing table from aborting the rest of this transaction.
+        try:
+            with conn.transaction():
+                ai_row = conn.execute(
+                    "SELECT report_date, generated_at, report_json, facts_json FROM daily_reports "
+                    "WHERE status = 'published' AND report_date >= %s::date - 2 "
+                    "ORDER BY report_date DESC LIMIT 1",
+                    (today_ct,),
+                ).fetchone()
+        except psycopg.Error:
+            ai_row = None
     finally:
         conn.close()
+
+    ai_report = None
+    if ai_row:
+        ai_report = {
+            "generated_at": ai_row["generated_at"].astimezone(ZoneInfo("America/Chicago")),
+            "report": json.loads(ai_row["report_json"]),
+            "facts": {f["id"]: f for f in json.loads(ai_row["facts_json"])},
+        }
 
     nr_by_month = {r["month"]: r for r in newrepeat}
     cum_by_month = {r["month"]: r["cumulative"] for r in cumulative}
@@ -298,12 +322,16 @@ def fetch_dashboard_data() -> dict:
         "top_days": [dict(r) for r in top_days],
         "lapsed": [dict(r) for r in lapsed],
         "insights": insights,
+        "ai_report": ai_report,
     }
 
 
 def render_html(data: dict) -> str:
     sms_ok = sum(r["c"] for r in data["sms_rows"] if r["status"] in ("sent", "delivered"))
-    sms_fail = sum(r["c"] for r in data["sms_rows"] if r["status"] not in ("sent", "delivered"))
+    # Twilio statuses: queued/accepted/sending are still in flight, not failures.
+    sms_fail = sum(r["c"] for r in data["sms_rows"] if r["status"] in ("failed", "undelivered"))
+    sms_pending = sum(r["c"] for r in data["sms_rows"]
+                      if r["status"] not in ("sent", "delivered", "failed", "undelivered"))
     sms_breakdown = "".join(
         f"<tr><td>{html.escape(str(r['campaign_type']))}</td><td>{html.escape(str(r['status']))}</td>"
         f"<td>{r['c']}</td></tr>"
@@ -350,7 +378,35 @@ def render_html(data: dict) -> str:
         f"<td>${s['avgTicket']:,.2f}</td><td>{fmt_mom(s['momGrowth'])}</td></tr>"
         for s in data["series"]
     )
-    good_html = "".join(f"<li>{html.escape(g)}</li>" for g in data["insights"]["good"])
+    ai = data.get("ai_report")
+    if ai:
+        facts = ai["facts"]
+
+        def sources(ids: list[str]) -> str:
+            return " · ".join(f"{facts[i]['label']}: {facts[i]['display']}" for i in ids if i in facts)
+
+        report = ai["report"]
+        insight_intro = (
+            f"Yapay zekâ bu değerlendirmeyi {ai['generated_at']:%Y-%m-%d %H:%M} (CT) itibarıyla veritabanındaki "
+            "sayılardan yazdı. İçindeki her sayı veritabanıyla otomatik karşılaştırıldı ve ikinci bir yapay zekâ "
+            "kontrolünden geçti. Her sabah 06:00'da yenilenir."
+        )
+        insight_footer = "Her maddenin altındaki satır, o maddenin dayandığı veritabanı sayılarıdır."
+        summary_html = f'<p class="insight-summary">{html.escape(report["summary"])}</p>'
+        good_html = "".join(
+            f'<li>{html.escape(g["text"])}<span class="insight-source">{html.escape(sources(g["facts_used"]))}</span></li>'
+            for g in report["good"]
+        )
+        watch_items = [
+            {**w, "trend": "Dayandığı veriler: " + sources(w["facts_used"])} for w in report["watch"]
+        ]
+    else:
+        insight_intro = "Bu bölüm her açılışta güncel verilerden yeniden hesaplanır — statik bir yorum değildir."
+        insight_footer = ('Her kutunun altındaki "Son 6 ay" satırı, bir sonraki ziyaretinizde aynı sinyalin '
+                          "düzelip düzelmediğini kendi gözünüzle karşılaştırmanız için var.")
+        summary_html = ""
+        good_html = "".join(f"<li>{html.escape(g)}</li>" for g in data["insights"]["good"])
+        watch_items = data["insights"]["watch"]
     watch_html = "".join(
         f"""<div class="insight-card">
               <p class="insight-issue">⚠️ {html.escape(w['issue'])}</p>
@@ -358,7 +414,7 @@ def render_html(data: dict) -> str:
               <p class="insight-action"><strong>Aksiyon:</strong> {html.escape(w['action'])}</p>
               <p class="insight-trend">{html.escape(w['trend'])}</p>
             </div>"""
-        for w in data["insights"]["watch"]
+        for w in watch_items
     )
 
     labels_json = json.dumps([month_label(s["month"]) for s in data["series"]])
@@ -443,6 +499,8 @@ def render_html(data: dict) -> str:
   .insight-why {{ font-size: 12px; color: var(--text-secondary); margin: 0 0 6px; }}
   .insight-action {{ font-size: 12px; margin: 0 0 6px; }}
   .insight-trend {{ font-size: 11px; color: var(--text-muted); margin: 0; font-variant-numeric: tabular-nums; }}
+  .insight-summary {{ font-size: 13px; line-height: 1.55; margin: 0 0 6px; }}
+  .insight-source {{ display: block; font-size: 11px; color: var(--text-muted); font-variant-numeric: tabular-nums; }}
 </style>
 </head>
 <body>
@@ -452,20 +510,22 @@ def render_html(data: dict) -> str:
 
   <div class="insight-panel">
     <p class="section-title" style="margin-top:0">Durum Değerlendirmesi ve Aksiyon Planı</p>
-    <p class="panel-sub">Bu bölüm her açılışta güncel verilerden yeniden hesaplanır — statik bir yorum değildir.</p>
+    <p class="panel-sub">{html.escape(insight_intro)}</p>
+    {summary_html}
 
     <p class="insight-heading insight-heading-good">✅ Güzel Giden Şeyler</p>
     <ul class="insight-good-list">{good_html or '<li>Henüz yeterli veri yok.</li>'}</ul>
 
     <p class="insight-heading insight-heading-watch">🔍 Sıkıntı Olan Şeyler ve Yapılması Gereken Aksiyonlar</p>
     {watch_html or '<p class="panel-sub">Şu an dikkat gerektiren bir sinyal tespit edilmedi.</p>'}
-    <p class="footer-note">Her kutunun altındaki "Son 6 ay" satırı, bir sonraki ziyaretinizde aynı sinyalin düzelip düzelmediğini kendi gözünüzle karşılaştırmanız için var.</p>
+    <p class="footer-note">{html.escape(insight_footer)}</p>
   </div>
 
   <div class="stat-row">
     <div class="stat-tile"><div class="stat-label">Bugünkü Ciro</div><div class="stat-value">${data['revenue_today']:,.2f}</div></div>
     <div class="stat-tile"><div class="stat-label">SMS (başarılı/başarısız)</div>
-      <div class="stat-value"><span class="stat-good">{sms_ok}</span> / <span class="stat-bad">{sms_fail}</span></div></div>
+      <div class="stat-value"><span class="stat-good">{sms_ok}</span> / <span class="stat-bad">{sms_fail}</span></div>
+      {f'<div class="stat-sub">{sms_pending} kuyrukta bekliyor</div>' if sms_pending else ''}</div>
     <div class="stat-tile"><div class="stat-label">Email Bugün</div><div class="stat-value">{data['email_today']}</div></div>
     <div class="stat-tile"><div class="stat-label">Randevu Bugün (gerçekleşen/toplam)</div>
       <div class="stat-value"><span class="stat-good">{data['appts_today']['done']}</span> / {data['appts_today']['total']}</div></div>
