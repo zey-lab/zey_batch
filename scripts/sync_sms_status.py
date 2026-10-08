@@ -4,7 +4,10 @@
 1. Delivery status: send_sms() stores the status Twilio reports a moment
    after the send (usually queued or sent) and nothing updated it afterwards,
    so the panel and the daily report never saw deliveries or carrier
-   failures. This fetches the current status of the last week's messages.
+   failures. This fetches the current status of the last week's messages
+   (--days to go further back). Carriers confirm most deliveries within a
+   minute, some after ~30 min; a message that stays "sent" got no delivery
+   receipt from the carrier. Runs after the noon send and before the report.
 2. STOP: a customer whose latest SMS was refused because they replied STOP
    (Twilio error 21610) is marked sms_opt_out, so campaigns stop retrying
    them every day. Twilio already blocks those sends, so no customer receives
@@ -38,7 +41,7 @@ TWILIO_UNSUBSCRIBED = "unsubscribed recipient"
 LOOKBACK_DAYS = 7
 
 
-def refresh_statuses(client, from_number: str, *, dry_run: bool = False) -> dict:
+def refresh_statuses(client, from_number: str, *, days: int = LOOKBACK_DAYS, dry_run: bool = False) -> dict:
     conn = get_connection()
     try:
         # Recent messages still in flight, plus recent failures stored without
@@ -49,11 +52,11 @@ def refresh_statuses(client, from_number: str, *, dry_run: bool = False) -> dict
             "(status <> ALL(%s) AND sent_at::timestamptz >= now() - make_interval(days => %s)) OR "
             "(status IN ('failed', 'undelivered') AND COALESCE(error_message, '') NOT LIKE '%%Twilio error%%' "
             "AND sent_at::timestamptz >= now() - interval '30 days'))",
-            (list(FINAL_STATUSES), LOOKBACK_DAYS),
+            (list(FINAL_STATUSES), days),
         ).fetchall()
         if not rows:
             return {"checked": 0, "updated": 0}
-        since = datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS + 1)
+        since = datetime.now(timezone.utc) - timedelta(days=days + 1)
         current = {m.sid: m for m in client.messages.list(from_=from_number, date_sent_after=since)}
         changes: dict[str, int] = {}
         for row in rows:
@@ -158,6 +161,8 @@ def mark_undeliverable(*, dry_run: bool = False) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--dry-run", action="store_true", help="report what would change, write nothing")
+    parser.add_argument("--days", type=int, default=LOOKBACK_DAYS,
+                        help=f"refresh statuses of messages sent in the last N days (default {LOOKBACK_DAYS})")
     args = parser.parse_args()
 
     from twilio.rest import Client
@@ -165,7 +170,7 @@ def main() -> int:
     client = Client(os.environ["TWILIO_ACCOUNT_SID"], os.environ["TWILIO_AUTH_TOKEN"])
     summary = {
         "dry_run": args.dry_run,
-        "status": refresh_statuses(client, os.environ["TWILIO_PHONE_NUMBER"], dry_run=args.dry_run),
+        "status": refresh_statuses(client, os.environ["TWILIO_PHONE_NUMBER"], days=args.days, dry_run=args.dry_run),
         "stop": sync_stop_opt_outs(ZeyDataStore(), dry_run=args.dry_run),
         "undeliverable": mark_undeliverable(dry_run=args.dry_run),
     }

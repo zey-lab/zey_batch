@@ -52,6 +52,23 @@ class TestSyncSmsStatus(unittest.TestCase):
             self.assertEqual(rows["SM2"]["status"], "undelivered")
             self.assertIn("30005", rows["SM2"]["error_message"])
 
+    def test_older_messages_are_refreshed_only_when_asked(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            store = self._store(temp_dir)
+            cid = self._customer_id("+15550000001")
+            store.log_sms(customer_id=cid, campaign_type="Campaign", message_text="hi", status="queued", twilio_sid="SM9")
+            conn = get_connection()
+            conn.execute("UPDATE sms_history SET sent_at=(now() - interval '20 days')::text WHERE twilio_sid='SM9'")
+            conn.commit()
+            conn.close()
+            client = Mock()
+            client.messages.list.return_value = [SimpleNamespace(sid="SM9", status="delivered", error_code=None)]
+
+            self.assertEqual(sync_sms_status.refresh_statuses(client, "+15559999999")["updated"], 0)
+            self.assertEqual(sync_sms_status.refresh_statuses(client, "+15559999999", days=30)["updated"], 1)
+            rows = {r["twilio_sid"]: r for r in store.export_table("sms_history").to_dict("records")}
+            self.assertEqual(rows["SM9"]["status"], "delivered")
+
     def test_only_customers_whose_latest_sms_hit_stop_are_opted_out(self) -> None:
         with TemporaryDirectory() as temp_dir:
             store = self._store(temp_dir)

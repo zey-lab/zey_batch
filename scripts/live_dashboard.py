@@ -340,6 +340,18 @@ def fetch_dashboard_data() -> dict:
     }
 
 
+# Twilio's SMS statuses in plain Turkish for the breakdown table.
+SMS_STATUS_TR = {
+    "delivered": "teslim edildi",
+    "sent": "operatöre iletildi, teslim onayı gelmedi",
+    "queued": "kuyrukta",
+    "accepted": "kuyrukta",
+    "sending": "gönderiliyor",
+    "undelivered": "teslim edilemedi",
+    "failed": "gönderilemedi",
+}
+
+
 def render_html(data: dict) -> str:
     sms_ok = sum(r["c"] for r in data["sms_rows"] if r["status"] in ("sent", "delivered"))
     # Twilio statuses: queued/accepted/sending are still in flight, not failures.
@@ -347,7 +359,8 @@ def render_html(data: dict) -> str:
     sms_pending = sum(r["c"] for r in data["sms_rows"]
                       if r["status"] not in ("sent", "delivered", "failed", "undelivered"))
     sms_breakdown = "".join(
-        f"<tr><td>{html.escape(str(r['campaign_type']))}</td><td>{html.escape(str(r['status']))}</td>"
+        f"<tr><td>{html.escape(str(r['campaign_type']))}</td>"
+        f"<td>{html.escape(SMS_STATUS_TR.get(r['status'], r['status']))} ({html.escape(str(r['status']))})</td>"
         f"<td>{r['c']}</td></tr>"
         for r in data["sms_rows"]
     )
@@ -561,6 +574,7 @@ def render_html(data: dict) -> str:
   <tbody>{txn_rows_html or '<tr><td colspan="3">Henüz işlem yok</td></tr>'}</tbody></table></div>
 
   <p class="section-title">SMS Kırılımı (Bugün)</p>
+  <p class="panel-sub">Teslim edildi: operatör mesajın telefona ulaştığını onayladı. Operatöre iletildi: mesaj operatöre geçti ama operatör teslim onayı göndermedi; bazı operatörler hiç göndermez, bu bir hata değildir. Durumlar gönderimden sonraki saatlerde Twilio'dan güncellenir.</p>
   <div class="table-wrap"><table><thead><tr><th>Tip</th><th>Durum</th><th>Adet</th></tr></thead>
   <tbody>{sms_breakdown or '<tr><td colspan="3">Henüz gönderim yok</td></tr>'}</tbody></table></div>
 
