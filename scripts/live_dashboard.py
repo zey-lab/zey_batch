@@ -49,6 +49,73 @@ def month_label(month: str) -> str:
     return f"{MONTH_LABELS_TR[m]} {y[2:]}"
 
 
+WEEKDAYS_TR = ("Pzt", "Sal", "Çar", "Per", "Cum", "Cmt", "Paz")  # ISO day 1-7
+WEEKDAY_NAMES_TR = ("Pazartesi", "Salı", "Çarşamba", "Perşembe", "Cuma", "Cumartesi", "Pazar")
+
+# Calendar day in Chicago of a transaction: the Vagaro report import stored
+# local time without an offset, the webhook stores UTC with "+00:00".
+TXN_DAY_CT = (
+    "CASE WHEN transaction_date ~ '(Z|[+-][0-9]{2}:?[0-9]{2})$' "
+    "THEN (transaction_date::timestamptz AT TIME ZONE 'America/Chicago')::date "
+    "ELSE transaction_date::timestamp::date END"
+)
+
+
+def fetch_weekday_rows(conn) -> list[dict]:
+    """Revenue, customers and open days per month and day of the week. A
+    customer counts once per day they paid (an unlinked payment by Vagaro's
+    id, then name, then checkout time, so the lines of one checkout count
+    once); a day with at least one payment counts as open."""
+    return [dict(r) for r in conn.execute(
+        "WITH days AS ("
+        " SELECT " + TXN_DAY_CT + " AS day, SUM(total_amount) AS revenue,"
+        " COUNT(DISTINCT COALESCE(customer_id::text, substring(raw_json from '\"CustomerID\": \"?([^\",}]+)'),"
+        " 'n:' || lower(customer_name), 't:' || transaction_date)) AS customers"
+        " FROM transactions WHERE transaction_date ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}' GROUP BY 1)"
+        " SELECT to_char(day, 'YYYY-MM') AS month, EXTRACT(ISODOW FROM day)::int AS dow,"
+        " COUNT(*) AS open_days, SUM(revenue) AS revenue, SUM(customers) AS customers,"
+        " MIN(MIN(day)) OVER () AS first_day"
+        " FROM days GROUP BY 1, 2 ORDER BY 1 DESC, 2"
+    ).fetchall()]
+
+
+def weekday_cell(revenue: float, customers: int, open_days: int) -> dict:
+    return {
+        "revenue": revenue, "customers": customers, "openDays": open_days,
+        "avgRevenue": revenue / open_days if open_days else 0.0,
+        "avgCustomers": customers / open_days if open_days else 0.0,
+    }
+
+
+def weekday_matrix(rows: list[dict], today_ct: str) -> dict:
+    """Month x weekday grid for the panel, newest month first, plus a
+    whole-period row per weekday."""
+    by_month: dict[str, dict[int, tuple]] = {}
+    for r in rows:
+        by_month.setdefault(r["month"], {})[r["dow"]] = (
+            float(r["revenue"] or 0), int(r["customers"]), int(r["open_days"]))
+    first_day = rows[0]["first_day"] if rows else None
+
+    def summed(cells: list[tuple]) -> dict | None:
+        if not cells:
+            return None
+        return weekday_cell(sum(c[0] for c in cells), sum(c[1] for c in cells), sum(c[2] for c in cells))
+
+    months = []
+    for month in sorted(by_month, reverse=True):
+        days = by_month[month]
+        partial = month == today_ct[:7] or (
+            first_day is not None and month == first_day.strftime("%Y-%m") and first_day.day > 1)
+        months.append({
+            "month": month, "partial": partial,
+            "cells": [weekday_cell(*days[d]) if d in days else None for d in range(1, 8)],
+            "total": summed(list(days.values())),
+        })
+    weekdays = [summed([m[d] for m in by_month.values() if d in m]) for d in range(1, 8)]
+    overall = summed([c for m in by_month.values() for c in m.values()])
+    return {"months": months, "weekdays": weekdays, "overall": overall, "firstDay": first_day}
+
+
 def build_insights(series: list[dict], active_staff: int) -> dict:
     """Freshly derives good/attention-needed signals from the same monthly
     series the charts use -- no hardcoded numbers, so it moves with the data
@@ -229,6 +296,8 @@ def fetch_dashboard_data() -> dict:
             "GROUP BY day ORDER BY revenue DESC LIMIT 3"
         ).fetchall()
 
+        weekday_rows = fetch_weekday_rows(conn)
+
         # Valuable customers who haven't come back yet -- stays on the list
         # until a new transaction updates their last_visit forward, at which
         # point they naturally drop off (or move down) on the next refresh.
@@ -333,11 +402,77 @@ def fetch_dashboard_data() -> dict:
         "optouts_today": optouts_today,
         "series": series,
         "top_days": [dict(r) for r in top_days],
+        "weekday": weekday_matrix(weekday_rows, today_ct),
         "lapsed": [dict(r) for r in lapsed],
         "insights": insights,
         "ai_report": ai_report,
         "undeliverable": [dict(r) for r in undeliverable],
     }
+
+
+def render_weekday_table(matrix: dict) -> str:
+    """The month x weekday table. Each cell carries both views (total and
+    per open day); a toggle above the table switches which one shows."""
+    cells = [c for m in matrix["months"] for c in m["cells"] if c]
+    max_total = max((c["revenue"] for c in cells), default=0)
+    max_avg = max((c["avgRevenue"] for c in cells), default=0)
+
+    def shade(value: float, top: float) -> str:
+        return f"{min(1.0, max(0.0, value / top)) if top > 0 else 0:.2f}"
+
+    def td(c: dict | None, heat: bool = True) -> str:
+        if not c:
+            return '<td class="wd-empty">—</td>'
+        attrs = (f' class="wd-heat" style="--h-total:{shade(c["revenue"], max_total)};'
+                 f'--h-avg:{shade(c["avgRevenue"], max_avg)}"') if heat else ' class="wd-sum"'
+        return (f"<td{attrs}>"
+                f'<span class="wd-total">${c["revenue"]:,.0f}<small>{c["customers"]} müşteri · {c["openDays"]} gün</small></span>'
+                f'<span class="wd-avg">${c["avgRevenue"]:,.0f}<small>{c["avgCustomers"]:.1f} müşteri/gün</small></span>'
+                "</td>")
+
+    body = "".join(
+        f"<tr><td>{month_label(m['month'])}{' *' if m['partial'] else ''}</td>"
+        + "".join(td(c) for c in m["cells"]) + td(m["total"], heat=False) + "</tr>"
+        for m in matrix["months"]
+    )
+    foot = ('<tr class="wd-foot"><td>Tüm dönem</td>'
+            + "".join(td(c, heat=False) for c in matrix["weekdays"]) + td(matrix["overall"], heat=False) + "</tr>")
+    head = "<tr><th>Ay</th>" + "".join(f"<th>{d}</th>" for d in WEEKDAYS_TR) + "<th>Ay geneli</th></tr>"
+    return (f'<table id="weekday-table" class="weekday mode-total"><thead>{head}</thead>'
+            f"<tbody>{body}</tbody><tfoot>{foot}</tfoot></table>")
+
+
+def weekday_summary(matrix: dict) -> str:
+    """Busiest and quietest weekday per open day over the whole period,
+    among weekdays open at least 4 times."""
+    ranked = sorted(
+        ((c["avgRevenue"], i, c) for i, c in enumerate(matrix["weekdays"]) if c and c["openDays"] >= 4),
+        key=lambda x: x[0],
+    )
+    if len(ranked) < 2:
+        return ""
+    (_, lo_i, lo), (_, hi_i, hi) = ranked[0], ranked[-1]
+    return (f"Tüm dönemde en kazançlı gün {WEEKDAY_NAMES_TR[hi_i]}: açık olunan gün başına ortalama "
+            f"${hi['avgRevenue']:,.0f} ve {hi['avgCustomers']:.1f} müşteri. En sakin gün {WEEKDAY_NAMES_TR[lo_i]}: "
+            f"${lo['avgRevenue']:,.0f} ve {lo['avgCustomers']:.1f} müşteri.")
+
+
+WEEKDAY_TOGGLE_JS = """
+(function () {
+  const table = document.getElementById("weekday-table");
+  const buttons = document.querySelectorAll("[data-wd-mode]");
+  if (!table) return;
+  function setMode(mode) {
+    table.className = "weekday mode-" + mode;
+    buttons.forEach(b => b.classList.toggle("active", b.dataset.wdMode === mode));
+    try { localStorage.setItem("weekdayMode", mode); } catch (e) {}
+  }
+  buttons.forEach(b => b.addEventListener("click", () => setMode(b.dataset.wdMode)));
+  let saved = null;
+  try { saved = localStorage.getItem("weekdayMode"); } catch (e) {}
+  if (saved === "total" || saved === "avg") setMode(saved);
+})();
+"""
 
 
 # Twilio's SMS statuses in plain Turkish for the breakdown table.
@@ -364,6 +499,8 @@ def render_html(data: dict) -> str:
         f"<td>{r['c']}</td></tr>"
         for r in data["sms_rows"]
     )
+    first_day = data["weekday"]["firstDay"]
+    weekday_note = f" (ilk kayıt {first_day:%d.%m.%Y})" if first_day else ""
     undeliverable_rows = "".join(
         f"<tr><td>{html.escape(r['name'])}</td><td>{html.escape(r['mobile'] or '—')}</td>"
         f"<td>{html.escape(r['reason'])}</td></tr>"
@@ -533,6 +670,19 @@ def render_html(data: dict) -> str:
   .insight-trend {{ font-size: 11px; color: var(--text-muted); margin: 0; font-variant-numeric: tabular-nums; }}
   .insight-summary {{ font-size: 13px; line-height: 1.55; margin: 0 0 6px; }}
   .insight-source {{ display: block; font-size: 11px; color: var(--text-muted); font-variant-numeric: tabular-nums; }}
+  .wd-toggle {{ display: inline-flex; gap: 4px; margin: 0 0 10px; background: var(--surface-2); border-radius: 8px; padding: 3px; }}
+  .wd-toggle button {{ border: 0; background: none; padding: 5px 10px; font-size: 12px; border-radius: 6px;
+    cursor: pointer; color: var(--text-secondary); font-family: inherit; }}
+  .wd-toggle button.active {{ background: var(--surface-1); color: var(--text-primary); font-weight: 600;
+    box-shadow: 0 1px 2px rgba(0,0,0,.08); }}
+  table.weekday td {{ white-space: nowrap; }}
+  table.weekday small {{ display: block; font-size: 10.5px; color: var(--text-muted); font-weight: 400; }}
+  table.weekday td.wd-sum {{ font-weight: 600; }}
+  table.weekday tfoot td {{ border-top: 2px solid var(--grid); }}
+  table.weekday.mode-total .wd-avg, table.weekday.mode-avg .wd-total {{ display: none; }}
+  table.weekday.mode-total td.wd-heat {{ background: rgba(42, 120, 214, calc(var(--h-total) * 0.35)); }}
+  table.weekday.mode-avg td.wd-heat {{ background: rgba(42, 120, 214, calc(var(--h-avg) * 0.35)); }}
+  .wd-empty {{ color: var(--text-muted); }}
 </style>
 </head>
 <body>
@@ -587,6 +737,12 @@ def render_html(data: dict) -> str:
 
   <p class="section-title">En Yüksek Ciro Yapan 3 Gün (Tüm Zamanlar)</p>
   <div class="top-days">{top_days_html}</div>
+
+  <p class="section-title">Ay ve Haftanın Günlerine Göre Ciro ve Müşteri</p>
+  <p class="panel-sub">{html.escape(weekday_summary(data['weekday']))} Koyu hücre daha yüksek ciro demek. Bir ayda her günden 4 ya da 5 tane olduğu için günleri karşılaştırırken "Gün başı ortalama"ya bakın. Müşteri: o gün ödeme yapan farklı kişi; ay içinde iki kez gelen iki kez sayılır. Gün: o ay o gün kaç kez ödeme alındığı (açık olunan gün).</p>
+  <div class="wd-toggle"><button type="button" data-wd-mode="total" class="active">Toplam</button><button type="button" data-wd-mode="avg">Gün başı ortalama</button></div>
+  <div class="table-wrap">{render_weekday_table(data['weekday'])}</div>
+  <p class="footer-note">* = ay tamamlanmadı ya da veri ayın ortasında başlıyor{weekday_note}.</p>
 
   <details class="collapsible">
     <summary class="section-title">Değerli Ama Uzun Süredir Gelmeyen Müşteriler ({len(data['lapsed'])})</summary>
@@ -813,6 +969,7 @@ new Chart(document.getElementById("chart-mom"), {{
 
 bar("chart-avgticket", "Ortalama İşlem ($)", AVG_TICKET, "#eb6834");
 </script>
+<script>{WEEKDAY_TOGGLE_JS}</script>
 </body>
 </html>"""
 
