@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sys
 import unittest
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
@@ -57,6 +57,34 @@ class TestWeekdayTable(unittest.TestCase):
         page = live_dashboard.render_weekday_table(matrix)
         self.assertIn("<th>Cmt</th>", page)
         self.assertIn("$90", page)
+
+    def test_year_heatmap_places_days_by_week_and_shades_by_quartile(self) -> None:
+        conn = get_connection()
+        try:
+            for i, (day, amount) in enumerate([("2026-10-03", 100.0), ("2026-10-02", 200.0), ("2026-10-01", 300.0),
+                                               ("2026-09-30", 400.0), ("2026-09-29", 500.0)]):
+                self._add(conn, f"h{i}", f"{day}T16:00:00+00:00", amount, customer_id=i + 1)
+            conn.commit()
+            today = date(2026, 10, 8)  # Thursday
+            rows = live_dashboard.fetch_daily_rows(conn, live_dashboard.heatmap_start(today))
+        finally:
+            conn.close()
+
+        hm = live_dashboard.year_heatmap(rows, today)
+        self.assertEqual(hm["days"][0]["day"], date(2026, 10, 5) - timedelta(weeks=52))
+        self.assertEqual(len(hm["days"]), 52 * 7 + 4)
+        self.assertEqual((hm["days"][-1]["week"], hm["days"][-1]["dow"]), (52, 3))
+        by_day = {x["day"]: x for x in hm["days"]}
+        self.assertEqual(by_day[date(2026, 10, 3)]["levelRev"], 1)
+        self.assertEqual(by_day[date(2026, 9, 29)]["levelRev"], 4)
+        self.assertEqual(by_day[date(2026, 10, 4)]["levelRev"], 0)  # Sunday, no payments
+        self.assertFalse(by_day[date(2026, 10, 4)]["noData"])
+        self.assertTrue(by_day[date(2026, 9, 1)]["noData"])  # before the first payment
+        self.assertEqual((hm["openDays"], hm["revenue"], hm["customers"]), (5, 1500.0, 5))
+        self.assertEqual(hm["busiest"]["day"], date(2026, 9, 29))
+
+        page = live_dashboard.render_year_heatmap(hm)
+        self.assertIn("Salı 29.09.2026: $500.00 ciro, 1 müşteri", page)
 
 
 if __name__ == "__main__":

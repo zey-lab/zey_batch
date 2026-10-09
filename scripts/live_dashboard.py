@@ -14,10 +14,11 @@ from __future__ import annotations
 import html
 import json
 import os
+import statistics
 import sys
 import threading
 import time
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -61,22 +62,82 @@ TXN_DAY_CT = (
 )
 
 
+# Revenue and paying customers per Chicago calendar day with payments. A
+# customer counts once per day they paid (an unlinked payment by Vagaro's id,
+# then name, then checkout time, so the lines of one checkout count once).
+DAILY_TOTALS_SQL = (
+    "SELECT " + TXN_DAY_CT + " AS day, SUM(total_amount) AS revenue,"
+    " COUNT(DISTINCT COALESCE(customer_id::text, substring(raw_json from '\"CustomerID\": \"?([^\",}]+)'),"
+    " 'n:' || lower(customer_name), 't:' || transaction_date)) AS customers"
+    " FROM transactions WHERE transaction_date ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}' GROUP BY 1"
+)
+
+
 def fetch_weekday_rows(conn) -> list[dict]:
-    """Revenue, customers and open days per month and day of the week. A
-    customer counts once per day they paid (an unlinked payment by Vagaro's
-    id, then name, then checkout time, so the lines of one checkout count
-    once); a day with at least one payment counts as open."""
+    """Revenue, customers and open days per month and day of the week; a day
+    with at least one payment counts as open."""
     return [dict(r) for r in conn.execute(
-        "WITH days AS ("
-        " SELECT " + TXN_DAY_CT + " AS day, SUM(total_amount) AS revenue,"
-        " COUNT(DISTINCT COALESCE(customer_id::text, substring(raw_json from '\"CustomerID\": \"?([^\",}]+)'),"
-        " 'n:' || lower(customer_name), 't:' || transaction_date)) AS customers"
-        " FROM transactions WHERE transaction_date ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}' GROUP BY 1)"
+        "WITH days AS (" + DAILY_TOTALS_SQL + ")"
         " SELECT to_char(day, 'YYYY-MM') AS month, EXTRACT(ISODOW FROM day)::int AS dow,"
         " COUNT(*) AS open_days, SUM(revenue) AS revenue, SUM(customers) AS customers,"
         " MIN(MIN(day)) OVER () AS first_day"
         " FROM days GROUP BY 1, 2 ORDER BY 1 DESC, 2"
     ).fetchall()]
+
+
+def fetch_daily_rows(conn, since: date) -> list[dict]:
+    """Revenue and customers per day from `since` on, plus the first day
+    with any payment at all."""
+    return [dict(r) for r in conn.execute(
+        "WITH days AS (" + DAILY_TOTALS_SQL + ")"
+        " SELECT day, revenue, customers, (SELECT MIN(day) FROM days) AS first_day"
+        " FROM days WHERE day >= %s ORDER BY day",
+        (since,),
+    ).fetchall()]
+
+
+def heatmap_start(today: date) -> date:
+    """Monday 52 weeks before this week's Monday: 53 week columns."""
+    return today - timedelta(days=today.weekday(), weeks=52)
+
+
+def quartile_cuts(values: list[float]) -> list[float]:
+    return statistics.quantiles(values, n=4, method="inclusive") if len(values) >= 2 else []
+
+
+def heat_level(value: float, cuts: list[float]) -> int:
+    """0 for no sales, then 1-4 by quartile among the open days, so one
+    record day doesn't wash out the rest."""
+    if value <= 0:
+        return 0
+    return 1 + sum(value > c for c in cuts)
+
+
+def year_heatmap(rows: list[dict], today: date) -> dict:
+    """GitHub-style calendar of the last 53 weeks: a column per week (Monday
+    first), a square per day."""
+    start = heatmap_start(today)
+    by_day = {r["day"]: (float(r["revenue"] or 0), int(r["customers"])) for r in rows}
+    first_day = rows[0]["first_day"] if rows else None
+    open_days = [v for d, v in by_day.items() if start <= d <= today and v[0] > 0]
+    rev_cuts = quartile_cuts([v[0] for v in open_days])
+    cust_cuts = quartile_cuts([v[1] for v in open_days])
+    days = []
+    for offset in range((today - start).days + 1):
+        d = start + timedelta(days=offset)
+        revenue, customers = by_day.get(d, (0.0, 0))
+        days.append({
+            "day": d, "week": offset // 7, "dow": offset % 7, "revenue": revenue, "customers": customers,
+            "levelRev": heat_level(revenue, rev_cuts),
+            "levelCust": heat_level(customers, cust_cuts) if revenue > 0 else 0,
+            "noData": first_day is None or d < first_day,
+        })
+    return {
+        "days": days, "revCuts": rev_cuts, "custCuts": cust_cuts, "firstDay": first_day,
+        "openDays": len(open_days), "revenue": sum(v[0] for v in open_days),
+        "customers": sum(v[1] for v in open_days),
+        "busiest": max((x for x in days if x["revenue"] > 0), key=lambda x: x["revenue"], default=None),
+    }
 
 
 def weekday_cell(revenue: float, customers: int, open_days: int) -> dict:
@@ -297,6 +358,7 @@ def fetch_dashboard_data() -> dict:
         ).fetchall()
 
         weekday_rows = fetch_weekday_rows(conn)
+        daily_rows = fetch_daily_rows(conn, heatmap_start(date.fromisoformat(today_ct)))
 
         # Valuable customers who haven't come back yet -- stays on the list
         # until a new transaction updates their last_visit forward, at which
@@ -403,6 +465,7 @@ def fetch_dashboard_data() -> dict:
         "series": series,
         "top_days": [dict(r) for r in top_days],
         "weekday": weekday_matrix(weekday_rows, today_ct),
+        "heatmap": year_heatmap(daily_rows, date.fromisoformat(today_ct)),
         "lapsed": [dict(r) for r in lapsed],
         "insights": insights,
         "ai_report": ai_report,
@@ -455,6 +518,87 @@ def weekday_summary(matrix: dict) -> str:
     return (f"Tüm dönemde en kazançlı gün {WEEKDAY_NAMES_TR[hi_i]}: açık olunan gün başına ortalama "
             f"${hi['avgRevenue']:,.0f} ve {hi['avgCustomers']:.1f} müşteri. En sakin gün {WEEKDAY_NAMES_TR[lo_i]}: "
             f"${lo['avgRevenue']:,.0f} ve {lo['avgCustomers']:.1f} müşteri.")
+
+
+def render_year_heatmap(hm: dict) -> str:
+    """The calendar grid and its legend. Each square carries a level for
+    revenue and one for customers; the toggle picks which one colors it."""
+    first = hm["firstDay"]
+    squares, months = [], []
+    for x in hm["days"]:
+        d, name = x["day"], WEEKDAY_NAMES_TR[x["dow"]]
+        if x["noData"]:
+            info = f"{name} {d:%d.%m.%Y}: kayıt yok" + (f" (kayıtlar {first:%d.%m.%Y} tarihinde başlıyor)" if first else "")
+        elif x["revenue"] > 0:
+            info = f"{name} {d:%d.%m.%Y}: ${x['revenue']:,.2f} ciro, {x['customers']} müşteri"
+        else:
+            info = f"{name} {d:%d.%m.%Y}: ödeme yok (kapalı)"
+        info = html.escape(info)
+        squares.append(
+            f'<span class="hm-day{" hm-nodata" if x["noData"] else ""}" '
+            f'style="grid-column:{x["week"] + 2};grid-row:{x["dow"] + 2}" '
+            f'data-lr="{x["levelRev"]}" data-lc="{x["levelCust"]}" title="{info}" data-info="{info}"></span>'
+        )
+        if d.day == 1:
+            months.append((x["week"], d))
+    if hm["days"] and (not months or months[0][0] >= 3):
+        months.insert(0, (0, hm["days"][0]["day"]))
+    labels = "".join(
+        f'<span class="hm-month" style="grid-column:{w + 2} / span 4">'
+        f'{MONTH_LABELS_TR[f"{d.month:02d}"]}{f" {d:%y}" if i == 0 or d.month == 1 else ""}</span>'
+        for i, (w, d) in enumerate(months)
+    )
+    weekdays = "".join(f'<span class="hm-wd" style="grid-row:{i + 2}">{WEEKDAYS_TR[i]}</span>' for i in range(7))
+
+    def cut_text(cuts: list[float], fmt) -> str:
+        if len(cuts) < 3:
+            return ""
+        return f"En açık yeşil {fmt(cuts[0])} ve altı, en koyu yeşil {fmt(cuts[2])} üstü."
+
+    rev_text = cut_text(hm["revCuts"], lambda v: f"${v:,.0f}")
+    cust_text = cut_text(hm["custCuts"], lambda v: f"{v:g} müşteri")
+    legend = "".join(f'<span class="hm-day" data-lr="{i}" data-lc="{i}"></span>' for i in range(5))
+    return (
+        f'<div class="hm-scroll"><div class="hm-grid">{labels}{weekdays}{"".join(squares)}</div></div>'
+        f'<div class="hm-legend">Az {legend} Çok'
+        f'<span class="hm-cut hm-cut-rev">{html.escape(rev_text)}</span>'
+        f'<span class="hm-cut hm-cut-cust">{html.escape(cust_text)}</span></div>'
+    )
+
+
+def heatmap_summary(hm: dict) -> str:
+    if not hm["openDays"]:
+        return ""
+    text = (f"Son bir yılda (53 hafta) {hm['openDays']} gün ödeme alındı: ${hm['revenue']:,.0f} ciro, "
+            f"{hm['customers']} müşteri.")
+    b = hm["busiest"]
+    if b:
+        text += (f" En yoğun gün {b['day']:%d.%m.%Y} {WEEKDAY_NAMES_TR[b['dow']]}: "
+                 f"${b['revenue']:,.0f}, {b['customers']} müşteri.")
+    return text
+
+
+HEATMAP_JS = """
+(function () {
+  const map = document.getElementById("heatmap");
+  if (!map) return;
+  const buttons = map.querySelectorAll("[data-hm-mode]");
+  const detail = document.getElementById("hm-detail");
+  function setMode(mode) {
+    map.className = "heatmap mode-" + mode;
+    buttons.forEach(b => b.classList.toggle("active", b.dataset.hmMode === mode));
+    try { localStorage.setItem("heatmapMode", mode); } catch (e) {}
+  }
+  buttons.forEach(b => b.addEventListener("click", () => setMode(b.dataset.hmMode)));
+  let saved = null;
+  try { saved = localStorage.getItem("heatmapMode"); } catch (e) {}
+  if (saved === "rev" || saved === "cust") setMode(saved);
+  map.querySelectorAll(".hm-day[data-info]").forEach(el =>
+    el.addEventListener("click", () => { detail.textContent = el.dataset.info; }));
+  const scroll = map.querySelector(".hm-scroll");
+  if (scroll) scroll.scrollLeft = scroll.scrollWidth;
+})();
+"""
 
 
 WEEKDAY_TOGGLE_JS = """
@@ -683,6 +827,23 @@ def render_html(data: dict) -> str:
   table.weekday.mode-total td.wd-heat {{ background: rgba(42, 120, 214, calc(var(--h-total) * 0.35)); }}
   table.weekday.mode-avg td.wd-heat {{ background: rgba(42, 120, 214, calc(var(--h-avg) * 0.35)); }}
   .wd-empty {{ color: var(--text-muted); }}
+  .hm-scroll {{ overflow-x: auto; padding-bottom: 4px; }}
+  .hm-grid {{ display: grid; grid-template-columns: 26px repeat(53, 12px); grid-template-rows: 14px repeat(7, 12px);
+    gap: 3px; width: max-content; }}
+  .hm-month {{ grid-row: 1; font-size: 10px; color: var(--text-secondary); white-space: nowrap; }}
+  .hm-wd {{ grid-column: 1; font-size: 9px; line-height: 12px; color: var(--text-muted); }}
+  .hm-day {{ width: 12px; height: 12px; border-radius: 2px; background: #ebedf0; cursor: pointer; }}
+  .hm-day.hm-nodata {{ background: transparent; outline: 1px dashed #d4d2cb; outline-offset: -1px; }}
+  .heatmap.mode-rev .hm-day[data-lr="1"], .heatmap.mode-cust .hm-day[data-lc="1"] {{ background: #9be9a8; }}
+  .heatmap.mode-rev .hm-day[data-lr="2"], .heatmap.mode-cust .hm-day[data-lc="2"] {{ background: #40c463; }}
+  .heatmap.mode-rev .hm-day[data-lr="3"], .heatmap.mode-cust .hm-day[data-lc="3"] {{ background: #30a14e; }}
+  .heatmap.mode-rev .hm-day[data-lr="4"], .heatmap.mode-cust .hm-day[data-lc="4"] {{ background: #216e39; }}
+  .hm-legend {{ display: flex; align-items: center; gap: 3px; flex-wrap: wrap; font-size: 11px;
+    color: var(--text-muted); margin-top: 8px; }}
+  .hm-legend .hm-day {{ display: inline-block; cursor: default; }}
+  .hm-cut {{ margin-left: 10px; }}
+  .heatmap.mode-rev .hm-cut-cust, .heatmap.mode-cust .hm-cut-rev {{ display: none; }}
+  .hm-detail {{ font-size: 12px; margin: 6px 0 0; min-height: 1.4em; color: var(--text-secondary); }}
 </style>
 </head>
 <body>
@@ -737,6 +898,14 @@ def render_html(data: dict) -> str:
 
   <p class="section-title">En Yüksek Ciro Yapan 3 Gün (Tüm Zamanlar)</p>
   <div class="top-days">{top_days_html}</div>
+
+  <p class="section-title">Yıllık Ciro Takvimi</p>
+  <p class="panel-sub">{html.escape(heatmap_summary(data['heatmap']))} Her kare bir gün; renk koyulaştıkça o gün ciro (ya da müşteri) daha fazla. Renkler açık olunan günlerin dörtte birlik dilimlerine göre. Gri: ödeme yok (kapalı), kesik çizgili: kayıt yok.</p>
+  <div id="heatmap" class="heatmap mode-rev">
+    <div class="wd-toggle"><button type="button" data-hm-mode="rev" class="active">Ciro</button><button type="button" data-hm-mode="cust">Müşteri</button></div>
+    {render_year_heatmap(data['heatmap'])}
+    <p class="hm-detail" id="hm-detail">Ayrıntı için bir kareye dokunun.</p>
+  </div>
 
   <p class="section-title">Ay ve Haftanın Günlerine Göre Ciro ve Müşteri</p>
   <p class="panel-sub">{html.escape(weekday_summary(data['weekday']))} Koyu hücre daha yüksek ciro demek. Bir ayda her günden 4 ya da 5 tane olduğu için günleri karşılaştırırken "Gün başı ortalama"ya bakın. Müşteri: o gün ödeme yapan farklı kişi; ay içinde iki kez gelen iki kez sayılır. Gün: o ay o gün kaç kez ödeme alındığı (açık olunan gün).</p>
@@ -970,6 +1139,7 @@ new Chart(document.getElementById("chart-mom"), {{
 bar("chart-avgticket", "Ortalama İşlem ($)", AVG_TICKET, "#eb6834");
 </script>
 <script>{WEEKDAY_TOGGLE_JS}</script>
+<script>{HEATMAP_JS}</script>
 </body>
 </html>"""
 
