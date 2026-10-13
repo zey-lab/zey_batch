@@ -27,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import psycopg  # noqa: E402
 
+from sms_campaign import forecast  # noqa: E402
 from sms_campaign.db import get_connection  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -35,6 +36,8 @@ HOST = os.getenv("DASHBOARD_HOST", "127.0.0.1")
 PORT = int(os.getenv("DASHBOARD_PORT", "8788"))
 TOKEN = os.getenv("DASHBOARD_TOKEN", "")
 
+MONTH_NAMES_TR = ("Ocak", "Şubat", "Mart", "Nisan", "Mayıs", "Haziran", "Temmuz",
+                  "Ağustos", "Eylül", "Ekim", "Kasım", "Aralık")
 MONTH_LABELS_TR = {
     "01": "Oca", "02": "Şub", "03": "Mar", "04": "Nis", "05": "May", "06": "Haz",
     "07": "Tem", "08": "Ağu", "09": "Eyl", "10": "Eki", "11": "Kas", "12": "Ara",
@@ -85,14 +88,11 @@ def fetch_weekday_rows(conn) -> list[dict]:
     ).fetchall()]
 
 
-def fetch_daily_rows(conn, since: date) -> list[dict]:
-    """Revenue and customers per day from `since` on, plus the first day
-    with any payment at all."""
+def fetch_daily_rows(conn) -> list[dict]:
+    """Revenue and customers per day with payments, plus the first such day."""
     return [dict(r) for r in conn.execute(
         "WITH days AS (" + DAILY_TOTALS_SQL + ")"
-        " SELECT day, revenue, customers, (SELECT MIN(day) FROM days) AS first_day"
-        " FROM days WHERE day >= %s ORDER BY day",
-        (since,),
+        " SELECT day, revenue, customers, (SELECT MIN(day) FROM days) AS first_day FROM days ORDER BY day"
     ).fetchall()]
 
 
@@ -358,7 +358,7 @@ def fetch_dashboard_data() -> dict:
         ).fetchall()
 
         weekday_rows = fetch_weekday_rows(conn)
-        daily_rows = fetch_daily_rows(conn, heatmap_start(date.fromisoformat(today_ct)))
+        daily_rows = fetch_daily_rows(conn)
 
         # Valuable customers who haven't come back yet -- stays on the list
         # until a new transaction updates their last_visit forward, at which
@@ -446,6 +446,12 @@ def fetch_dashboard_data() -> dict:
         })
         prev_revenue = revenue
 
+    month_forecast = forecast.forecast(
+        {r["day"]: (float(r["revenue"] or 0), int(r["customers"])) for r in daily_rows},
+        {s["month"]: s["cust"] for s in series},
+        date.fromisoformat(today_ct),
+    )
+
     revenue_today = sum(float(r["total_amount"] or 0) for r in txn_today)
     customers_today = len({r["cust_key"] for r in txn_today})
     avg_per_customer_today = (revenue_today / customers_today) if customers_today else 0.0
@@ -466,6 +472,7 @@ def fetch_dashboard_data() -> dict:
         "top_days": [dict(r) for r in top_days],
         "weekday": weekday_matrix(weekday_rows, today_ct),
         "heatmap": year_heatmap(daily_rows, date.fromisoformat(today_ct)),
+        "forecast": month_forecast,
         "lapsed": [dict(r) for r in lapsed],
         "insights": insights,
         "ai_report": ai_report,
@@ -518,6 +525,66 @@ def weekday_summary(matrix: dict) -> str:
     return (f"Tüm dönemde en kazançlı gün {WEEKDAY_NAMES_TR[hi_i]}: açık olunan gün başına ortalama "
             f"${hi['avgRevenue']:,.0f} ve {hi['avgCustomers']:.1f} müşteri. En sakin gün {WEEKDAY_NAMES_TR[lo_i]}: "
             f"${lo['avgRevenue']:,.0f} ve {lo['avgCustomers']:.1f} müşteri.")
+
+
+def month_name(month: str) -> str:
+    y, m = month.split("-")
+    return f"{MONTH_NAMES_TR[int(m) - 1]} {y}"
+
+
+def pct_change(new: float, old: float | None) -> str:
+    if not old:
+        return ""
+    p = (new - old) / old * 100
+    return f"%{abs(p):.0f} {'artış' if p >= 0 else 'düşüş'}" if round(p) else "değişim yok"
+
+
+def render_forecast(fc: dict) -> str:
+    """Month-end forecast card; the method is in src/sms_campaign/forecast.py."""
+    name, prev = month_name(fc["month"]), month_name(fc["prevMonth"])
+    tiles = [
+        '<div class="stat-tile"><div class="stat-label">Ay sonu ciro tahmini</div>'
+        f'<div class="stat-value">${fc["revenue"]:,.0f}</div>'
+        f'<div class="stat-sub">olası aralık ${fc["revenueLow"]:,.0f} – ${fc["revenueHigh"]:,.0f}</div>'
+        f'<div class="stat-sub">{prev}: ${fc["prevRevenue"]:,.0f} · {pct_change(fc["revenue"], fc["prevRevenue"])}</div></div>'
+    ]
+    if fc["customers"] is not None:
+        prev_cust = (f'<div class="stat-sub">{prev}: {fc["prevCustomers"]} · '
+                     f'{pct_change(fc["customers"], fc["prevCustomers"])}</div>') if fc["prevCustomers"] else ""
+        tiles.append(
+            '<div class="stat-tile"><div class="stat-label">Ay sonu farklı müşteri tahmini</div>'
+            f'<div class="stat-value">{fc["customers"]:.0f}</div>'
+            f'<div class="stat-sub">olası aralık {fc["customersLow"]:.0f} – {fc["customersHigh"]:.0f}</div>{prev_cust}</div>'
+        )
+    tiles.append(
+        '<div class="stat-tile"><div class="stat-label">Şu ana kadar</div>'
+        f'<div class="stat-value">${fc["actualRevenue"]:,.0f}</div>'
+        f'<div class="stat-sub">{fc["daysElapsed"]} / {fc["daysInMonth"]} gün · {fc["actualCustomers"]} müşteri</div></div>'
+    )
+    if fc["prevRevenue"] and fc["actualRevenue"] >= fc["prevRevenue"]:
+        target = f"{prev} cirosu (${fc['prevRevenue']:,.0f}) şimdiden geçildi."
+    elif fc["neededPerOpenDay"] is not None:
+        on_pace = fc["recentPerOpenDay"] >= fc["neededPerOpenDay"]
+        target = (f"{prev} cirosunu (${fc['prevRevenue']:,.0f}) geçmek için kalan {fc['openDaysLeft']} açık günde "
+                  f"günde ortalama ${fc['neededPerOpenDay']:,.0f} gerekiyor; son 4 haftada açık günlerde günde "
+                  f"ortalama ${fc['recentPerOpenDay']:,.0f} kazanıldı, "
+                  + ("bu tempoyla geçiliyor." if on_pace else "bu tempo yetmiyor."))
+    else:
+        target = ""
+    accuracy = ""
+    if fc["revenueMape"] is not None:
+        accuracy = (f" Aralık: aynı yöntem son {len(fc['backtests'])} ayda ayın aynı gününde uygulandığında ay sonunu "
+                    f"ne kadar ıskaladığına göre; ortalama ıskalama ciroda %{fc['revenueMape'] * 100:.0f}"
+                    + (f", müşteride %{fc['customersMape'] * 100:.0f}." if fc["customersMape"] is not None else "."))
+    method = ("Nasıl hesaplanıyor: bu ayın şu ana kadarki cirosuna, kalan her gün için son 4 haftada haftanın aynı "
+              "gününde kazanılan ortalama ekleniyor (kapalı günler $0 sayılır). Müşteri tahmini aynı yolla, ziyaretten "
+              "farklı müşteriye son 3 ayın oranıyla çevriliyor." + accuracy)
+    return (
+        f'<div class="panel fc-panel"><p class="panel-title">{name} Ay Sonu Tahmini</p>'
+        f'<div class="stat-row">{"".join(tiles)}</div>'
+        + (f'<p class="fc-target">{html.escape(target)}</p>' if target else "")
+        + f'<p class="panel-sub">{html.escape(method)}</p></div>'
+    )
 
 
 def render_year_heatmap(hm: dict) -> str:
@@ -691,6 +758,27 @@ def render_html(data: dict) -> str:
         f"<td>${s['avgTicket']:,.2f}</td><td>{fmt_mom(s['momGrowth'])}</td></tr>"
         for s in data["series"]
     )
+    # The month-end forecast as an extra row and as the rest of this month's
+    # bar in the revenue and customer charts.
+    fc = data["forecast"]
+    current = data["series"][-1] if data["series"] else None
+    forecast_js = "null"
+    if fc and current and current["month"] == fc["month"]:
+        growth = (fc["revenue"] - fc["prevRevenue"]) / fc["prevRevenue"] * 100 if fc["prevRevenue"] else None
+        cust_cell = (f'{fc["customers"]:.0f}<small>{fc["customersLow"]:.0f}–{fc["customersHigh"]:.0f}</small>'
+                     if fc["customers"] is not None else "—")
+        table_rows_html += (
+            f'<tr class="fc-row"><td>{month_label(fc["month"])} tahmini</td>'
+            f'<td>${fc["revenue"]:,.0f}<small>${fc["revenueLow"]:,.0f}–${fc["revenueHigh"]:,.0f}</small></td>'
+            f"<td>—</td><td>{cust_cell}</td><td>—</td><td>—</td><td>—</td><td>—</td><td>{fmt_mom(growth)}</td></tr>"
+        )
+        forecast_js = json.dumps({
+            "revenue": {"rest": max(0.0, fc["revenue"] - current["revenue"]), "total": fc["revenue"],
+                        "low": fc["revenueLow"], "high": fc["revenueHigh"]},
+            "customers": None if fc["customers"] is None else {
+                "rest": max(0.0, fc["customers"] - current["cust"]), "total": fc["customers"],
+                "low": fc["customersLow"], "high": fc["customersHigh"]},
+        })
     ai = data.get("ai_report")
     if ai:
         facts = ai["facts"]
@@ -827,6 +915,10 @@ def render_html(data: dict) -> str:
   table.weekday.mode-total td.wd-heat {{ background: rgba(42, 120, 214, calc(var(--h-total) * 0.35)); }}
   table.weekday.mode-avg td.wd-heat {{ background: rgba(42, 120, 214, calc(var(--h-avg) * 0.35)); }}
   .wd-empty {{ color: var(--text-muted); }}
+  .fc-panel .stat-tile {{ background: var(--surface-1); }}
+  .fc-target {{ font-size: 12.5px; margin: 0 0 8px; }}
+  tr.fc-row td {{ background: #eef6ee; font-style: italic; }}
+  tr.fc-row small {{ display: block; font-size: 10.5px; color: var(--text-muted); font-style: normal; }}
   .hm-scroll {{ overflow-x: auto; padding-bottom: 4px; }}
   .hm-grid {{ display: grid; grid-template-columns: 26px repeat(53, 12px); grid-template-rows: 14px repeat(7, 12px);
     gap: 3px; width: max-content; }}
@@ -930,6 +1022,7 @@ def render_html(data: dict) -> str:
   </details>
 
   <p class="section-title">Aylık Büyüme</p>
+  {render_forecast(fc) if fc else ''}
 
   <div class="panel">
     <p class="panel-title">Aylık Ciro</p>
@@ -981,7 +1074,7 @@ def render_html(data: dict) -> str:
   <tbody>{table_rows_html}</tbody></table>
   </div>
 
-  <p class="footer-note">* = ay henüz tamamlanmadı, diğer aylarla doğrudan kıyaslanmamalı.</p>
+  <p class="footer-note">* = ay henüz tamamlanmadı, diğer aylarla doğrudan kıyaslanmamalı. "Tahmini" satırı ay sonu tahminidir; küçük yazı olası aralıktır, AÜA Büyüme tahminin geçen aya göre değişimidir.</p>
 </div>
 <script>
 const LABELS = {labels_json};
@@ -993,6 +1086,7 @@ const NEW_REV = {new_rev_json};
 const REPEAT_REV = {repeat_rev_json};
 const AVG_TICKET = {avg_ticket_json};
 const MOM = {mom_json};
+const FORECAST = {forecast_js};
 const LAPSED = {lapsed_json};
 
 // --- Lapsed-customer table: sortable (multi-key via shift-click), searchable ---
@@ -1086,9 +1180,32 @@ function bar(id, label, data, color) {{
   }});
 }}
 
-bar("chart-revenue", "Ciro ($)", REVENUE, "#2a78d6");
+// This month's bar plus, stacked on top, what the forecast still expects.
+function barWithForecast(id, label, data, color, fc) {{
+  if (!fc) {{ bar(id, label, data, color); return; }}
+  const money = label.includes("Ciro");
+  const fmt = v => (money ? "$" : "") + Math.round(v).toLocaleString("en-US");
+  const rest = data.map((v, i) => i === data.length - 1 ? fc.rest : null);
+  const options = baseOptions(money);
+  options.scales.x.stacked = true;
+  options.scales.y.stacked = true;
+  options.plugins.tooltip.callbacks.footer = items =>
+    items.length && items[0].dataIndex === data.length - 1
+      ? "Ay sonu tahmini: " + fmt(fc.total) + " (" + fmt(fc.low) + " – " + fmt(fc.high) + ")" : "";
+  new Chart(document.getElementById(id), {{
+    type: "bar",
+    data: {{ labels: LABELS, datasets: [
+      {{ label, data, backgroundColor: color, borderRadius: 5, maxBarThickness: 28 }},
+      {{ label: "Ay sonuna kadar beklenen", data: rest, backgroundColor: color + "40", borderColor: color,
+         borderWidth: 1, borderRadius: 5, maxBarThickness: 28 }}
+    ] }},
+    options
+  }});
+}}
+
+barWithForecast("chart-revenue", "Ciro ($)", REVENUE, "#2a78d6", FORECAST && FORECAST.revenue);
 bar("chart-txn", "İşlem", TXN, "#eb6834");
-bar("chart-cust", "Farklı Müşteri", CUST, "#1baf7a");
+barWithForecast("chart-cust", "Farklı Müşteri", CUST, "#1baf7a", FORECAST && FORECAST.customers);
 bar("chart-cumcust", "Kümülatif Müşteri", CUM, "#4a3aa7");
 
 new Chart(document.getElementById("chart-newrepeat"), {{

@@ -66,7 +66,7 @@ class TestWeekdayTable(unittest.TestCase):
                 self._add(conn, f"h{i}", f"{day}T16:00:00+00:00", amount, customer_id=i + 1)
             conn.commit()
             today = date(2026, 10, 8)  # Thursday
-            rows = live_dashboard.fetch_daily_rows(conn, live_dashboard.heatmap_start(today))
+            rows = live_dashboard.fetch_daily_rows(conn)
         finally:
             conn.close()
 

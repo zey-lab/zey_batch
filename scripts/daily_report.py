@@ -142,6 +142,34 @@ def collect_facts(today: date) -> list[Fact]:
             v, d = change(r_avg, e_avg)
             add(f"chg.3m.{key}", f"Son 3 tam ayın {what}, önceki 3 aya göre değişimi", v, d)
 
+    # Month-end forecast (src/sms_campaign/forecast.py), so the actions can
+    # aim at where the month is heading.
+    fc = data.get("forecast")
+    if fc:
+        name, prev_name = month_name(fc["month"]), month_name(fc["prevMonth"])
+        how = "bu ayın gerçekleşeni + kalan her gün için son 4 haftanın haftanın aynı günü ortalaması"
+        add("fc.revenue", f"{name} ay sonu ciro tahmini ({how})", round(fc["revenue"]), money(fc["revenue"]))
+        add("fc.revenue_range", f"{name} ay sonu ciro tahmininin olası aralığı (yöntemin geçmiş aylardaki isabetine "
+            "göre)", round(fc["revenueLow"]), f"{money(fc['revenueLow'])} – {money(fc['revenueHigh'])}")
+        if fc["revenueMape"] is not None:
+            add("fc.accuracy", "Bu tahmin yönteminin geçmiş aylarda ay sonu cirosunu ortalama ıskalama payı",
+                round(fc["revenueMape"] * 100), f"%{fc['revenueMape'] * 100:.0f}")
+        if fc["prevRevenue"]:
+            v, d = change(fc["revenue"], fc["prevRevenue"])
+            add("chg.fc.revenue", f"{name} ay sonu ciro tahmini, {prev_name} cirosuna göre", v, d)
+        if fc["customers"] is not None:
+            add("fc.customers", f"{name} ay sonu ödeme yapan müşteri sayısı tahmini", round(fc["customers"]),
+                f"{fc['customers']:.0f}")
+            if fc["prevCustomers"]:
+                v, d = change(fc["customers"], fc["prevCustomers"])
+                add("chg.fc.customers", f"{name} ay sonu müşteri tahmini, {prev_name} ödeme yapan müşteri sayısına "
+                    "göre", v, d)
+        if fc["neededPerOpenDay"] is not None and fc["actualRevenue"] < fc["prevRevenue"]:
+            add("fc.needed_per_day", f"{prev_name} cirosunu geçmek için kalan {fc['openDaysLeft']} açık günde gereken "
+                "günlük ortalama ciro", round(fc["neededPerOpenDay"]), money(fc["neededPerOpenDay"]))
+        add("fc.recent_per_open_day", "Son 4 haftada açık günlerde günlük ortalama ciro",
+            round(fc["recentPerOpenDay"]), money(fc["recentPerOpenDay"]))
+
     conn = get_connection()
     try:
         def revenue_customers(start: date, end: date) -> tuple[float, int, int]:
@@ -381,7 +409,9 @@ Notes on the data: the salon is closed on some days (see the open_days facts), "
 cover the same days, and a customer counts as new in the period of their first payment. When no campaign has \
 the email channel turned on, sending no email is expected: email is an unused channel, not a failure. STOP \
 opt-outs and undeliverable numbers are handled automatically every morning; don't ask the owner to do that \
-part -- the only manual step is correcting the numbers listed on the panel in Vagaro.
+part -- the only manual step is correcting the numbers listed on the panel in Vagaro. The fc.* facts are a \
+month-end forecast, not results: present them as a forecast ("tahmin ediliyor", "bekleniyor") and, when you \
+give the forecast, its range too. When fc facts exist, the summary says where the month is heading.
 
 Today is {today} (America/Chicago).
 
