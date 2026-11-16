@@ -90,6 +90,81 @@ def fetch_weekday_rows(conn) -> list[dict]:
     ).fetchall()]
 
 
+# A visit is one customer's payments on one Chicago day: Vagaro records every
+# service as its own payment row, so a visit is ~1.4 rows. Rows without a
+# customer id (1-3%) are left out of visit metrics.
+VISITS_CTE = (
+    "v AS (SELECT customer_id, (transaction_date::timestamptz AT TIME ZONE 'America/Chicago')::date AS dt, "
+    "SUM(total_amount) AS amt, COUNT(*) AS lines FROM transactions "
+    "WHERE customer_id IS NOT NULL AND transaction_date ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}' GROUP BY 1, 2), "
+    "f AS (SELECT customer_id, MIN(dt) AS first, COUNT(*) AS visits, MAX(dt) AS last, SUM(amt) AS spent "
+    "FROM v GROUP BY 1)"
+)
+
+# Who to bring back: SMS-reachable active customers with no upcoming booking
+# and no SMS sent in the last 21 days.
+REACHABLE_SQL = (
+    "cu.active = 1 AND cu.mobile IS NOT NULL AND COALESCE(cu.sms_opt_out, 0) <> 1 "
+    "AND cu.sms_undeliverable IS NULL "
+    "AND NOT EXISTS (SELECT 1 FROM services s WHERE s.customer_id = cu.customer_id "
+    "  AND s.service_date ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T' "
+    "  AND (s.service_date::timestamptz AT TIME ZONE 'America/Chicago')::date >= %(today)s "
+    "  AND COALESCE(s.booking_status, '') NOT IN ('Cancel', 'Deleted')) "
+    "AND NOT EXISTS (SELECT 1 FROM sms_history h WHERE h.customer_id = cu.customer_id "
+    "  AND h.sent_at::timestamptz >= %(today)s::date - 21 AND h.status IN ('sent', 'delivered'))"
+)
+
+# Overdue: a regular's own median gap between visits, shrunk toward the
+# median of all gaps (a personal median from 2-3 visits is mostly noise),
+# passed by 30%, within 120 days of the last visit.
+SHRINK_VISITS = 3
+OVERDUE_FACTOR = 1.3
+
+
+def fetch_visit_mix(conn) -> list[dict]:
+    """Per month: visits, revenue per visit and services per visit, for
+    first visits and for returning customers' visits."""
+    return [dict(r) for r in conn.execute(
+        "WITH " + VISITS_CTE +
+        " SELECT to_char(v.dt, 'YYYY-MM') AS month, (v.dt = f.first) AS is_new, COUNT(*) AS visits, "
+        "AVG(v.amt) AS per_visit, AVG(v.lines) AS lines FROM v JOIN f USING (customer_id) "
+        "GROUP BY 1, 2 ORDER BY 1, 2"
+    ).fetchall()]
+
+
+def fetch_second_visit(conn, today: str) -> list[dict]:
+    """First-timers 14-45 days after their only visit: due for a second one."""
+    return [dict(r) for r in conn.execute(
+        "WITH " + VISITS_CTE +
+        " SELECT COALESCE(NULLIF(TRIM(CONCAT_WS(' ', cu.first_name, cu.last_name)), ''), '—') AS name, "
+        "cu.mobile, f.first, %(today)s::date - f.first AS days, f.spent "
+        "FROM f JOIN customers cu USING (customer_id) "
+        "WHERE f.visits = 1 AND %(today)s::date - f.first BETWEEN 14 AND 45 AND " + REACHABLE_SQL +
+        " ORDER BY f.first",
+        {"today": today},
+    ).fetchall()]
+
+
+def fetch_overdue(conn, today: str) -> list[dict]:
+    """Regulars past their usual rhythm; the most recently overdue first,
+    as they are the likeliest to come back."""
+    return [dict(r) for r in conn.execute(
+        "WITH " + VISITS_CTE + ", "
+        "g AS (SELECT customer_id, dt - LAG(dt) OVER (PARTITION BY customer_id ORDER BY dt) AS gap FROM v), "
+        "allg AS (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY gap) AS med FROM g WHERE gap IS NOT NULL), "
+        "p AS (SELECT customer_id, COUNT(*) AS n, percentile_cont(0.5) WITHIN GROUP (ORDER BY gap) AS med "
+        "      FROM g WHERE gap IS NOT NULL GROUP BY 1), "
+        "r AS (SELECT p.customer_id, (p.n * p.med + %(k)s * allg.med) / (p.n + %(k)s) AS usual "
+        "      FROM p CROSS JOIN allg) "
+        "SELECT COALESCE(NULLIF(TRIM(CONCAT_WS(' ', cu.first_name, cu.last_name)), ''), '—') AS name, "
+        "cu.mobile, f.visits, ROUND(r.usual)::int AS usual, %(today)s::date - f.last AS days, f.spent "
+        "FROM r JOIN f USING (customer_id) JOIN customers cu USING (customer_id) "
+        "WHERE %(today)s::date - f.last > %(factor)s * r.usual AND %(today)s::date - f.last <= 120 AND "
+        + REACHABLE_SQL + " ORDER BY (%(today)s::date - f.last) / r.usual, f.spent DESC",
+        {"today": today, "k": SHRINK_VISITS, "factor": OVERDUE_FACTOR},
+    ).fetchall()]
+
+
 def fetch_daily_rows(conn) -> list[dict]:
     """Revenue and customers per day with payments, plus the first such day."""
     return [dict(r) for r in conn.execute(
@@ -231,10 +306,11 @@ def build_insights(series: list[dict], active_staff: int) -> dict:
             })
 
     if len(full) >= 2:
-        first_ticket, last_ticket = full[0]["avgTicket"], full[-1]["avgTicket"]
-        if last_ticket > first_ticket * 1.15:
+        first_ticket = full[0].get("visitMix", {}).get("perVisit")
+        last_ticket = full[-1].get("visitMix", {}).get("perVisit")
+        if first_ticket and last_ticket and last_ticket > first_ticket * 1.15:
             good.append(
-                f"Ortalama işlem büyüklüğü yükseliyor: {month_label(full[0]['month'])} döneminde ${first_ticket:.2f} idi, "
+                f"Ziyaret başı ciro yükseliyor: {month_label(full[0]['month'])} döneminde ${first_ticket:.2f} idi, "
                 f"şimdi ${last_ticket:.2f} — fiyatlandırma/hizmet karması güçleniyor."
             )
 
@@ -362,6 +438,9 @@ def fetch_dashboard_data() -> dict:
         weekday_rows = fetch_weekday_rows(conn)
         daily_rows = fetch_daily_rows(conn)
         snapshots = forecast_snapshots.load(conn)
+        visit_mix = fetch_visit_mix(conn)
+        second_visit = fetch_second_visit(conn, today_ct)
+        overdue = fetch_overdue(conn, today_ct)
 
         # Valuable customers who haven't come back yet -- stays on the list
         # until a new transaction updates their last_visit forward, at which
@@ -458,6 +537,39 @@ def fetch_dashboard_data() -> dict:
     month_forecast = forecast.forecast(daily, {s["month"]: s["cust"] for s in series}, today, snapshots)
     forecast_history = forecast.daily_history(daily, today, snapshots=snapshots) if month_forecast else []
 
+    # Month over month for the unfinished month: a part month against a whole
+    # one always looks like a fall, so use the forecast against last month,
+    # and this month so far against the same days of last month.
+    mom = {"forecast": None, "mtd": None}
+    if month_forecast and month_forecast["prevRevenue"]:
+        mom["forecast"] = (month_forecast["revenue"] - month_forecast["prevRevenue"]) / month_forecast["prevRevenue"] * 100
+    if today.day > 1:
+        first = today.replace(day=1)
+        prev_first = forecast.prev_month(first)
+        prev_last = prev_first.replace(day=min(today.day - 1, forecast.month_end(prev_first).day))
+        mtd = sum(v[0] for d, v in daily.items() if first <= d < today)
+        prev_mtd = sum(v[0] for d, v in daily.items() if prev_first <= d <= prev_last)
+        if prev_mtd:
+            mom["mtd"] = (mtd - prev_mtd) / prev_mtd * 100
+    for s in series:
+        s["momForecast"] = mom["forecast"] if s["partial"] else None
+
+    mix: dict[str, dict] = {}
+    for r in visit_mix:
+        m = mix.setdefault(r["month"], {"month": r["month"]})
+        kind = "new" if r["is_new"] else "ret"
+        m[kind + "Visits"] = r["visits"]
+        m[kind + "PerVisit"] = float(r["per_visit"])
+        m[kind + "Lines"] = float(r["lines"])
+    for m in mix.values():
+        visits = m.get("newVisits", 0) + m.get("retVisits", 0)
+        m["perVisit"] = ((m.get("newPerVisit", 0) * m.get("newVisits", 0) + m.get("retPerVisit", 0) * m.get("retVisits", 0))
+                         / visits if visits else None)
+        m["lines"] = ((m.get("newLines", 0) * m.get("newVisits", 0) + m.get("retLines", 0) * m.get("retVisits", 0))
+                      / visits if visits else None)
+    for s in series:
+        s["visitMix"] = mix.get(s["month"], {})
+
     revenue_today = sum(float(r["total_amount"] or 0) for r in txn_today)
     customers_today = len({r["cust_key"] for r in txn_today})
     avg_per_customer_today = (revenue_today / customers_today) if customers_today else 0.0
@@ -480,6 +592,9 @@ def fetch_dashboard_data() -> dict:
         "heatmap": year_heatmap(daily_rows, date.fromisoformat(today_ct)),
         "forecast": month_forecast,
         "forecast_history": forecast_history,
+        "mom": mom,
+        "second_visit": second_visit,
+        "overdue": overdue,
         "lapsed": [dict(r) for r in lapsed],
         "insights": insights,
         "ai_report": ai_report,
@@ -785,6 +900,37 @@ FORECAST_HISTORY_JS = """
 """
 
 
+def render_winback(second_visit: list[dict], overdue: list[dict]) -> str:
+    """The two lists of customers to bring back this week."""
+    def table(head: list[str], rows: list[list[str]]) -> str:
+        body = "".join("<tr>" + "".join(f"<td>{html.escape(c)}</td>" for c in r) + "</tr>" for r in rows)
+        return ('<div class="table-wrap"><table><thead><tr>' + "".join(f"<th>{h}</th>" for h in head)
+                + f'</tr></thead><tbody>{body or "<tr><td colspan=" + str(len(head)) + ">Yok</td></tr>"}</tbody></table></div>')
+
+    second = table(
+        ["Müşteri", "Telefon", "İlk ziyaret", "Gün önce", "Harcama"],
+        [[r["name"], r["mobile"] or "—", r["first"].strftime("%d.%m.%Y"), str(r["days"]), f"${float(r['spent']):,.0f}"]
+         for r in second_visit])
+    late = table(
+        ["Müşteri", "Telefon", "Ziyaret", "Genelde her", "Son ziyaret", "Toplam harcama"],
+        [[r["name"], r["mobile"] or "—", str(r["visits"]), f"{r['usual']} günde", f"{r['days']} gün önce",
+          f"${float(r['spent']):,.0f}"] for r in overdue])
+    return (
+        '<details class="collapsible">'
+        f'<summary class="section-title">İkinci Ziyarete Gelmeyen Yeni Müşteriler ({len(second_visit)})</summary>'
+        '<p class="panel-sub">İlk ve tek ziyareti 14–45 gün önce olan, ileri tarihli randevusu olmayan müşteriler. '
+        "Yeni müşterilerin çoğu ikinci kez gelmiyor; kaş için tipik aralık 3–5 hafta, yani şu an tam zamanı. SMS ile ulaşılabilenler; son 21 günde SMS gönderilenler listede yok. Eskiden yeniye sıralı "
+        "(en uzun süredir bekleyen üstte).</p>" + second + "</details>"
+        '<details class="collapsible">'
+        f'<summary class="section-title">Her Zamanki Aralığını Geçen Düzenli Müşteriler ({len(overdue)})</summary>'
+        '<p class="panel-sub">En az iki kez gelmiş, kendi alışkanlığına göre gelme zamanını %30 geçmiş (son 120 gün '
+        "içinde gelmiş), ileri tarihli randevusu olmayan müşteriler. \"Genelde her\": müşterinin ziyaretleri arasındaki "
+        "tipik süre; az ziyareti olanlarda tüm müşterilerin tipik aralığına doğru yumuşatılır. Gecikmesi en yeni "
+        "olan üstte: geri gelme ihtimali en yüksek olanlar. SMS ile ulaşılabilenler; son 21 günde SMS gönderilenler "
+        "listede yok.</p>" + late + "</details>"
+    )
+
+
 def render_year_heatmap(hm: dict) -> str:
     """The calendar grid and its legend. Each square carries a level for
     revenue and one for customers; the toggle picks which one colors it."""
@@ -953,7 +1099,9 @@ def render_html(data: dict) -> str:
         f"<tr><td>{month_label(s['month'])}{' *' if s['partial'] else ''}</td>"
         f"<td>${s['revenue']:,.0f}</td><td>{s['txn']}</td><td>{s['cust']}</td>"
         f"<td>${s['newRev']:,.0f}</td><td>${s['repeatRev']:,.0f}</td><td>{s['cumCust']}</td>"
-        f"<td>${s['avgTicket']:,.2f}</td><td>{fmt_mom(s['momGrowth'])}</td></tr>"
+        + (f"<td>${s['visitMix']['perVisit']:,.2f}</td>" if s["visitMix"].get("perVisit") else "<td>—</td>")
+        # A part month against a whole one: its change is in the forecast row.
+        + f"<td>{'—' if s['partial'] else fmt_mom(s['momGrowth'])}</td></tr>"
         for s in data["series"]
     )
     # The month-end forecast as an extra row and as the rest of this month's
@@ -1023,8 +1171,12 @@ def render_html(data: dict) -> str:
     cum_json = json.dumps([s["cumCust"] for s in data["series"]])
     new_rev_json = json.dumps([s["newRev"] for s in data["series"]])
     repeat_rev_json = json.dumps([s["repeatRev"] for s in data["series"]])
-    avg_ticket_json = json.dumps([s["avgTicket"] for s in data["series"]])
-    mom_json = json.dumps([s["momGrowth"] for s in data["series"]])
+    def mix_json(key: str) -> str:
+        return json.dumps([s["visitMix"].get(key) for s in data["series"]])
+
+    # The unfinished month's bar is the forecast's change, drawn lighter.
+    mom_json = json.dumps([s["momForecast"] if s["partial"] else s["momGrowth"] for s in data["series"]])
+    mom_fc_json = json.dumps([bool(s["partial"] and s["momForecast"] is not None) for s in data["series"]])
 
     return f"""<!DOCTYPE html>
 <html lang="tr">
@@ -1174,7 +1326,8 @@ def render_html(data: dict) -> str:
       {f'<div class="stat-sub">{data["appts_today"]["cancelled"]} iptal/silinen hariç</div>' if data['appts_today']['cancelled'] else ''}</div>
     <div class="stat-tile"><div class="stat-label">Yeni Opt-out</div><div class="stat-value">{data['optouts_today']}</div></div>
     <div class="stat-tile"><div class="stat-label">Müşteri Başı Ortalama (Bugün)</div><div class="stat-value">${data['avg_per_customer_today']:,.2f}</div></div>
-    <div class="stat-tile"><div class="stat-label">Ay-üstü-Ay Büyüme</div><div class="stat-value">{fmt_mom(data['current_mom'])}</div></div>
+    <div class="stat-tile"><div class="stat-label">Ay-üstü-Ay Büyüme (ay sonu tahmini)</div><div class="stat-value">{fmt_mom(data['mom']['forecast'])}</div>
+      {f'<div class="stat-sub">bu ay şimdiye kadar, geçen ayın aynı günlerine göre: {fmt_mom(data["mom"]["mtd"])}</div>' if data['mom']['mtd'] is not None else ''}</div>
   </div>
 
   <p class="section-title">Bugünkü İşlemler</p>
@@ -1225,6 +1378,7 @@ def render_html(data: dict) -> str:
     <tbody id="lapsed-body"></tbody></table>
     </div>
   </details>
+  {render_winback(data.get('second_visit') or [], data.get('overdue') or [])}
 
   <p class="section-title">Aylık Büyüme</p>
   {render_forecast(fc) if fc else ''}
@@ -1243,9 +1397,9 @@ def render_html(data: dict) -> str:
   </div>
 
   <div class="panel">
-    <p class="panel-title">Aylık İşlem Sayısı</p>
-    <p class="panel-sub">Toplam satış/ziyaret adedi</p>
-    <canvas id="chart-txn"></canvas>
+    <p class="panel-title">Aylık Ziyaret Sayısı</p>
+    <p class="panel-sub">Ziyaret: bir müşterinin bir gündeki ödemeleri. Vagaro her hizmeti ayrı ödeme satırı (işlem) olarak kaydeder; bir ziyaret ortalama ~1.4 işlemdir. Yeni: müşterinin ilk ziyareti.</p>
+    <canvas id="chart-visits"></canvas>
   </div>
 
   <div class="panel">
@@ -1262,21 +1416,27 @@ def render_html(data: dict) -> str:
 
   <div class="panel">
     <p class="panel-title">Ay-üstü-Ay Büyüme %</p>
-    <p class="panel-sub">Önceki aya göre ciro değişimi</p>
+    <p class="panel-sub">Önceki aya göre ciro değişimi. Bu ay henüz bitmediği için açık renkli çubuk, ay sonu tahmininin geçen aya göre değişimidir.</p>
     <canvas id="chart-mom"></canvas>
   </div>
 
   <div class="panel">
-    <p class="panel-title">Ortalama İşlem Büyüklüğü</p>
-    <p class="panel-sub">Aylık ciro / aylık işlem sayısı</p>
-    <canvas id="chart-avgticket"></canvas>
+    <p class="panel-title">Ziyaret Başı Ortalama Ciro</p>
+    <p class="panel-sub">Bir ziyarette bırakılan ortalama tutar (bahşiş ve vergi dahil), ilk kez gelenler ve tekrar gelenler ayrı. Fiyatlar değişmediğinde bu çizgiyi asıl ziyaret başına alınan hizmet sayısı belirler (aşağıda).</p>
+    <canvas id="chart-pervisit"></canvas>
+  </div>
+
+  <div class="panel">
+    <p class="panel-title">Ziyaret Başına Hizmet Sayısı</p>
+    <p class="panel-sub">Bir ziyarette alınan ortalama hizmet (ödeme satırı). Örneğin kaş + dudak = 2. Ek hizmet önermek bu sayıyı ve ciroyu doğrudan artırır.</p>
+    <canvas id="chart-lines"></canvas>
   </div>
 
   <p class="section-title">Tablo Görünümü</p>
   <div class="table-wrap">
   <table><thead><tr><th>Ay</th><th>Ciro</th><th>İşlem</th><th>Farklı Müşteri</th>
     <th>Yeni Müşteri Geliri</th><th>Sadık Müşteri Geliri</th><th>Kümülatif Müşteri</th>
-    <th>Ort. İşlem</th><th>AÜA Büyüme</th></tr></thead>
+    <th>Ziyaret Başı</th><th>AÜA Büyüme</th></tr></thead>
   <tbody>{table_rows_html}</tbody></table>
   </div>
 
@@ -1290,8 +1450,16 @@ const CUST = {cust_json};
 const CUM = {cum_json};
 const NEW_REV = {new_rev_json};
 const REPEAT_REV = {repeat_rev_json};
-const AVG_TICKET = {avg_ticket_json};
 const MOM = {mom_json};
+const MOM_FC = {mom_fc_json};
+const NEW_VISITS = {mix_json("newVisits")};
+const RET_VISITS = {mix_json("retVisits")};
+const NEW_PER_VISIT = {mix_json("newPerVisit")};
+const RET_PER_VISIT = {mix_json("retPerVisit")};
+const PER_VISIT = {mix_json("perVisit")};
+const NEW_LINES = {mix_json("newLines")};
+const RET_LINES = {mix_json("retLines")};
+const LINES = {mix_json("lines")};
 const FORECAST = {forecast_js};
 const FORECAST_HISTORY = {forecast_history_json(data.get('forecast_history') or [])};
 const LAPSED = {lapsed_json};
@@ -1411,7 +1579,6 @@ function barWithForecast(id, label, data, color, fc) {{
 }}
 
 barWithForecast("chart-revenue", "Ciro ($)", REVENUE, "#2a78d6", FORECAST && FORECAST.revenue);
-bar("chart-txn", "İşlem", TXN, "#eb6834");
 barWithForecast("chart-cust", "Farklı Müşteri", CUST, "#1baf7a", FORECAST && FORECAST.customers);
 bar("chart-cumcust", "Kümülatif Müşteri", CUM, "#4a3aa7");
 
@@ -1440,7 +1607,9 @@ new Chart(document.getElementById("chart-mom"), {{
     labels: LABELS,
     datasets: [{{
       label: "AÜA Büyüme %", data: MOM, borderRadius: 5, maxBarThickness: 28,
-      backgroundColor: MOM.map(v => v === null ? "#c3c2b7" : (v >= 0 ? "#1baf7a" : "#e34948"))
+      backgroundColor: MOM.map((v, i) => v === null ? "#c3c2b7" : (v >= 0 ? "#1baf7a" : "#e34948") + (MOM_FC[i] ? "55" : "")),
+      borderColor: MOM.map(v => v === null ? "#c3c2b7" : (v >= 0 ? "#1baf7a" : "#e34948")),
+      borderWidth: MOM_FC.map(f => f ? 1.5 : 0)
     }}]
   }},
   options: {{
@@ -1450,7 +1619,8 @@ new Chart(document.getElementById("chart-mom"), {{
       tooltip: {{
         backgroundColor: "#0b0b0b", padding: 10, cornerRadius: 8,
         titleFont: {{ family: FONT, weight: 600 }}, bodyFont: {{ family: FONT }},
-        callbacks: {{ label: (ctx) => ctx.parsed.y === null ? "veri yok" : (ctx.parsed.y >= 0 ? "+" : "") + ctx.parsed.y.toFixed(1) + "%" }}
+        callbacks: {{ label: (ctx) => ctx.parsed.y === null ? "veri yok" : (ctx.parsed.y >= 0 ? "+" : "") + ctx.parsed.y.toFixed(1) + "%"
+                       + (MOM_FC[ctx.dataIndex] ? " (ay sonu tahmini)" : "") }}
       }}
     }},
     scales: {{
@@ -1460,7 +1630,36 @@ new Chart(document.getElementById("chart-mom"), {{
   }}
 }});
 
-bar("chart-avgticket", "Ortalama İşlem ($)", AVG_TICKET, "#eb6834");
+// Visit charts: first visits vs returning customers' visits.
+function mixLegend() {{
+  return {{ display: true, position: "top", align: "start",
+           labels: {{ boxWidth: 10, boxHeight: 10, font: {{ size: 11.5 }} }} }};
+}}
+new Chart(document.getElementById("chart-visits"), {{
+  type: "bar",
+  data: {{ labels: LABELS, datasets: [
+    {{ label: "Tekrar gelen", data: RET_VISITS, backgroundColor: "#2a78d6", borderRadius: 4, maxBarThickness: 28 }},
+    {{ label: "İlk ziyaret", data: NEW_VISITS, backgroundColor: "#8fb7e8", borderRadius: 4, maxBarThickness: 28 }}
+  ] }},
+  options: (() => {{ const o = baseOptions(false); o.plugins.legend = mixLegend();
+    o.scales.x.stacked = true; o.scales.y.stacked = true; return o; }})()
+}});
+function mixLine(id, money, all, ret, neu) {{
+  const o = baseOptions(money);
+  o.plugins.legend = mixLegend();
+  o.scales.y.beginAtZero = false;
+  o.interaction = {{ mode: "index", intersect: false }};
+  o.plugins.tooltip.callbacks = {{ label: ctx => ctx.dataset.label + ": " +
+    (ctx.parsed.y === null ? "—" : money ? "$" + ctx.parsed.y.toFixed(2) : ctx.parsed.y.toFixed(2)) }};
+  if (!money) o.scales.y.ticks.callback = v => v.toFixed(2);
+  const ds = (label, data, color, dash) => ({{ label, data, borderColor: color, backgroundColor: color,
+    borderWidth: dash ? 1.5 : 2, borderDash: dash ? [5, 4] : [], pointRadius: 2.5, tension: 0.2, spanGaps: true }});
+  new Chart(document.getElementById(id), {{ type: "line", data: {{ labels: LABELS, datasets: [
+    ds("Tüm ziyaretler", all, "#0b0b0b", true), ds("Tekrar gelen", ret, "#2a78d6"), ds("İlk ziyaret", neu, "#eb6834")
+  ] }}, options: o }});
+}}
+mixLine("chart-pervisit", true, PER_VISIT, RET_PER_VISIT, NEW_PER_VISIT);
+mixLine("chart-lines", false, LINES, RET_LINES, NEW_LINES);
 </script>
 <script>{FORECAST_HISTORY_JS}</script>
 <script>{WEEKDAY_TOGGLE_JS}</script>

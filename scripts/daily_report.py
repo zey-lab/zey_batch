@@ -345,6 +345,37 @@ def collect_facts(today: date) -> list[Fact]:
     add("lapsed.spent", "Bu müşterilerin bugüne kadarki toplam harcaması", round(spent), money(spent))
     add("lapsed.sms_reachable", "Bu müşterilerden SMS ile ulaşılabilen (telefonu olan, listeden çıkmamış)",
         reachable, str(reachable))
+
+    # Who to bring back this week: the panel's two lists (SMS-reachable, no
+    # upcoming booking, no SMS in the last 21 days).
+    second, overdue = data.get("second_visit") or [], data.get("overdue") or []
+    add("winback.second_visit", "İlk ve tek ziyareti 14–45 gün önce olan, randevusu olmayan, SMS ile ulaşılabilen yeni "
+        "müşteri (panelde 'İkinci Ziyarete Gelmeyen Yeni Müşteriler' listesi)", len(second), str(len(second)))
+    add("winback.overdue", "Kendi her zamanki gelme aralığını geçmiş, randevusu olmayan, SMS ile ulaşılabilen düzenli "
+        "müşteri (panelde 'Her Zamanki Aralığını Geçen Düzenli Müşteriler' listesi)", len(overdue), str(len(overdue)))
+
+    # Spend per visit: a visit is one customer's payments on one day (a
+    # payment row is one service), for the last two full months.
+    full_mix = [s for s in data["series"] if not s["partial"] and s.get("visitMix", {}).get("perVisit")]
+    if len(full_mix) >= 2:
+        last, prev = full_mix[-1], full_mix[-2]
+        ln, pn = month_name(last["month"]), month_name(prev["month"])
+        lm, pm = last["visitMix"], prev["visitMix"]
+        add("visit.per_visit", f"{ln} ziyaret başı ortalama ciro (bir müşterinin bir gündeki ödemeleri)",
+            round(lm["perVisit"], 2), money(lm["perVisit"], True))
+        add("visit.per_visit.prev", f"{pn} ziyaret başı ortalama ciro", round(pm["perVisit"], 2),
+            money(pm["perVisit"], True))
+        v, d = change(lm["perVisit"], pm["perVisit"])
+        add("chg.visit.per_visit", f"{ln} ziyaret başı ciro, {pn} ayına göre", v, d)
+        add("visit.lines", f"{ln} ziyaret başına alınan ortalama hizmet sayısı", round(lm["lines"], 2),
+            f"{lm['lines']:.2f}")
+        add("visit.lines.prev", f"{pn} ziyaret başına alınan ortalama hizmet sayısı", round(pm["lines"], 2),
+            f"{pm['lines']:.2f}")
+        if lm.get("newLines") and lm.get("retLines"):
+            add("visit.lines.new", f"{ln} ilk kez gelen müşterilerin ziyaret başına aldığı hizmet sayısı",
+                round(lm["newLines"], 2), f"{lm['newLines']:.2f}")
+            add("visit.lines.returning", f"{ln} tekrar gelen müşterilerin ziyaret başına aldığı hizmet sayısı",
+                round(lm["retLines"], 2), f"{lm['retLines']:.2f}")
     return facts
 
 
@@ -459,9 +490,13 @@ give the forecast, its range too. When fc facts exist, the summary says where th
 The owner's goal every month is to beat the previous month's revenue, so the report is about reaching it:
 - When fc.gap exists, the first watch item is closing that gap: give the gap, the extra visits it takes \
 (fc.extra_visits, fc.extra_visits_per_day) and today's target (fc.today_target). Tie the action to concrete \
-levers the facts show, such as the lapsed customers reachable by SMS (lapsed.*) or few bookings in the next 7 \
-days (next7.*), with numbers from those facts. Merge the other forecast and month-to-date facts into this item \
-instead of writing separate items about the same shortfall.
+levers the facts show, with numbers from those facts: first-timers due for a second visit (winback.second_visit) \
+and regulars past their usual rhythm (winback.overdue), both listed on the panel to text this week; few bookings \
+in the next 7 days (next7.*); and, when services per visit fell (visit.lines*), offering a second service at \
+checkout. Merge the other forecast and month-to-date facts into this item instead of writing separate items \
+about the same shortfall. Keep the report to at most 3 actions in total.
+- A "visit" (ziyaret) is one customer's payments on one day; a payment row (işlem) is one service. Never mix \
+the two words.
 - When fc.on_track or fc.prev_beaten exists, the month is heading past last month: say so in good, and say what \
 to keep doing in the summary.
 - When fc.yesterday_* facts exist, say whether yesterday met its target: in good when it did, inside the gap \
