@@ -1,10 +1,13 @@
 """Month-end forecast of revenue and paying customers, for the live panel
 and the daily report.
 
-The method is kept simple enough to check by hand:
-
-- Revenue: what has been paid this month so far, plus, for every remaining
-  day, the average revenue of that weekday over the 4 weeks before today.
+- Revenue: what has been paid this month so far, plus the expected revenue
+  of every remaining day. When that morning's stored model run exists
+  (forecast_snapshots, from forecast_models.py: the average of ETS and
+  Prophet), its day-by-day expectation is used: 5.1% average miss against
+  7.0% for the weekday means below. Otherwise, and as the fallback, every
+  remaining day gets the average revenue of that weekday over the 4 weeks
+  before today.
   Closed days count as $0, so the usual closing day and recent closures are
   priced in. Today counts only for what it hasn't brought in yet. Replayed
   over Jan-Sep 2026, 4 weeks missed the final month by 8% on average, 8
@@ -18,6 +21,8 @@ The method is kept simple enough to check by hand:
   then. The smallest and largest misses on the remaining days bound the
   range (which always includes the forecast itself); the average miss is
   the stated accuracy.
+- Daily history: the revenue forecast replayed as of the start of each day
+  of this month and the months before, so day-to-day changes can be seen.
 """
 
 from __future__ import annotations
@@ -28,8 +33,30 @@ from datetime import date, timedelta
 LOOKBACK_WEEKS = 4
 BACKTEST_MONTHS = 6
 RATIO_MONTHS = 3
+HISTORY_MONTHS = 6
 
 Daily = dict[date, tuple[float, float]]  # day -> (revenue, customer visits)
+# as_of -> {"actualBefore": revenue of the month before as_of,
+#           "days": expected revenue of as_of, as_of + 1, ... month end}
+Snapshots = dict[date, dict]
+
+FALLBACK_MODEL = "weekday4"
+
+
+def snapshot_revenue(snap: dict) -> tuple[float, float]:
+    """(month-end revenue, rest of the month) of a stored morning."""
+    rest = sum(snap["days"])
+    return snap["actualBefore"] + rest, rest
+
+
+def morning_revenue(daily: Daily, as_of: date, snapshots: Snapshots | None) -> tuple[float, float, str]:
+    """(month-end revenue, rest, model) as of the morning of as_of: the stored
+    model run when there is one, else the weekday means on the days before."""
+    if snapshots and as_of in snapshots:
+        revenue, rest = snapshot_revenue(snapshots[as_of])
+        return revenue, rest, "snapshot"
+    p = project({d: v for d, v in daily.items() if d < as_of}, as_of)
+    return p["revenue"], p["restRevenue"], FALLBACK_MODEL
 
 
 def month_end(d: date) -> date:
@@ -99,9 +126,11 @@ def customer_ratio(daily: Daily, monthly_customers: dict[str, int], first: date)
     return customers / visits if visits else None
 
 
-def backtest(daily: Daily, monthly_customers: dict[str, int], today: date) -> list[dict]:
+def backtest(daily: Daily, monthly_customers: dict[str, int], today: date,
+             snapshots: Snapshots | None = None) -> list[dict]:
     """The method replayed on past full months as of today's day of the
-    month, knowing only the days before that date."""
+    month, knowing only the days before that date. Revenue comes from that
+    morning's stored model run when there is one."""
     first_day = min(daily)
     results = []
     m = prev_month(today)
@@ -110,18 +139,54 @@ def backtest(daily: Daily, monthly_customers: dict[str, int], today: date) -> li
         if as_of - timedelta(weeks=LOOKBACK_WEEKS) < first_day:
             break
         p = project({d: v for d, v in daily.items() if d < as_of}, as_of)
+        revenue, rest_revenue, _ = morning_revenue(daily, as_of, snapshots)
         final_rev, _ = month_totals(daily, m)
         ratio = customer_ratio(daily, monthly_customers, m)
         final_cust = monthly_customers.get(m.strftime("%Y-%m"))
         results.append({
             "month": m.strftime("%Y-%m"), "asOf": as_of,
-            "revenue": p["revenue"], "restRevenue": p["restRevenue"], "finalRevenue": final_rev,
+            "revenue": revenue, "restRevenue": rest_revenue, "finalRevenue": final_rev,
             "customers": p["visits"] * ratio if ratio else None,
             "restCustomers": p["restVisits"] * ratio if ratio else None,
             "finalCustomers": final_cust,
         })
         m = prev_month(m)
     return results
+
+
+def daily_history(daily: Daily, today: date, months: int = HISTORY_MONTHS,
+                  snapshots: Snapshots | None = None) -> list[dict]:
+    """The month-end revenue forecast as it stood at the start of each day,
+    knowing only the days before it: what the panel showed that morning.
+    Covers today's month and up to months - 1 months before it, newest
+    first; days without LOOKBACK_WEEKS weeks of history are skipped. Each
+    point carries its change from the day before. Past months also carry
+    their final revenue, to see how the forecast closed in on it."""
+    if not daily:
+        return []
+    first_day = min(daily)
+    history = []
+    m = today.replace(day=1)
+    while len(history) < months:
+        points = []
+        d = max(m, first_day + timedelta(weeks=LOOKBACK_WEEKS))
+        while d <= min(month_end(m), today):
+            revenue = morning_revenue(daily, d, snapshots)[0]
+            prev = points[-1]["revenue"] if points else None
+            points.append({
+                "day": d, "revenue": revenue,
+                "change": None if prev is None else revenue - prev,
+                "changePct": (revenue - prev) / prev if prev else None,
+            })
+            d += timedelta(days=1)
+        if not points:
+            break
+        history.append({
+            "month": m.strftime("%Y-%m"), "days": points,
+            "finalRevenue": None if m == today.replace(day=1) else month_totals(daily, m)[0],
+        })
+        m = prev_month(m)
+    return history
 
 
 def _range(forecast: float, rest: float, floor: float, tests: list[tuple[float, float, float]]) -> tuple[float, float, float | None]:
@@ -135,15 +200,25 @@ def _range(forecast: float, rest: float, floor: float, tests: list[tuple[float, 
     return low, high, sum(mape) / len(mape) if mape else None
 
 
-def forecast(daily: Daily, monthly_customers: dict[str, int], today: date) -> dict | None:
+def forecast(daily: Daily, monthly_customers: dict[str, int], today: date,
+             snapshots: Snapshots | None = None) -> dict | None:
     """Month-end forecast for today's month; None until there are
-    LOOKBACK_WEEKS weeks of history."""
+    LOOKBACK_WEEKS weeks of history. With this morning's stored model run,
+    revenue is today's takings so far plus the model's expectation for the
+    rest of today and the days after."""
     if not daily or today - timedelta(weeks=LOOKBACK_WEEKS) < min(daily):
         return None
     first = today.replace(day=1)
     month, prev = first.strftime("%Y-%m"), prev_month(first)
     p = project(daily, today)
-    tests = backtest(daily, monthly_customers, today)
+    model = FALLBACK_MODEL
+    if snapshots and today in snapshots:
+        expected = snapshots[today]["days"]
+        today_rev = daily.get(today, (0.0, 0))[0]
+        p["restRevenue"] = max(0.0, expected[0] - today_rev) + sum(expected[1:])
+        p["revenue"] = p["actualRevenue"] + p["restRevenue"]
+        model = "snapshot"
+    tests = backtest(daily, monthly_customers, today, snapshots)
 
     rev_low, rev_high, rev_mape = _range(
         p["revenue"], p["restRevenue"], p["actualRevenue"],
@@ -172,5 +247,5 @@ def forecast(daily: Daily, monthly_customers: dict[str, int], today: date) -> di
         "actualCustomers": actual_customers,
         "prevMonth": prev.strftime("%Y-%m"), "prevRevenue": prev_rev, "prevCustomers": prev_cust,
         "openDaysLeft": p["openDaysLeft"], "neededPerOpenDay": needed,
-        "recentPerOpenDay": p["recentPerOpenDay"], "backtests": tests,
+        "recentPerOpenDay": p["recentPerOpenDay"], "backtests": tests, "model": model,
     }

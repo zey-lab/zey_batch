@@ -95,8 +95,15 @@ def span(start: date, end: date) -> str:
 
 
 def collect_facts(today: date) -> list[Fact]:
+    import forecast_snapshots
     import live_dashboard
 
+    # This morning's month-end forecast model run, so the report and the
+    # panel give the same forecast; the weekday means stand in if it fails.
+    try:
+        forecast_snapshots.ensure()
+    except Exception as exc:  # noqa: BLE001
+        print(f"forecast snapshots failed, using the weekday means: {exc}", file=sys.stderr)
     data = live_dashboard.fetch_dashboard_data()
     facts: list[Fact] = []
 
@@ -147,7 +154,9 @@ def collect_facts(today: date) -> list[Fact]:
     fc = data.get("forecast")
     if fc:
         name, prev_name = month_name(fc["month"]), month_name(fc["prevMonth"])
-        how = "bu ayın gerçekleşeni + kalan her gün için son 4 haftanın haftanın aynı günü ortalaması"
+        how = ("bu ayın gerçekleşeni + kalan her gün için ETS ve Prophet tahmin modellerinin ortalaması"
+               if fc.get("model") == "snapshot"
+               else "bu ayın gerçekleşeni + kalan her gün için son 4 haftanın haftanın aynı günü ortalaması")
         add("fc.revenue", f"{name} ay sonu ciro tahmini ({how})", round(fc["revenue"]), money(fc["revenue"]))
         add("fc.revenue_range", f"{name} ay sonu ciro tahmininin olası aralığı (yöntemin geçmiş aylardaki isabetine "
             "göre)", round(fc["revenueLow"]), f"{money(fc['revenueLow'])} – {money(fc['revenueHigh'])}")

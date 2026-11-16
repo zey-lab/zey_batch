@@ -30,6 +30,8 @@ import psycopg  # noqa: E402
 from sms_campaign import forecast  # noqa: E402
 from sms_campaign.db import get_connection  # noqa: E402
 
+import forecast_snapshots  # noqa: E402  (scripts/, next to this file)
+
 ROOT = Path(__file__).resolve().parents[1]
 STATE_PATH = ROOT / "data" / "dashboard_state.txt"
 HOST = os.getenv("DASHBOARD_HOST", "127.0.0.1")
@@ -359,6 +361,7 @@ def fetch_dashboard_data() -> dict:
 
         weekday_rows = fetch_weekday_rows(conn)
         daily_rows = fetch_daily_rows(conn)
+        snapshots = forecast_snapshots.load(conn)
 
         # Valuable customers who haven't come back yet -- stays on the list
         # until a new transaction updates their last_visit forward, at which
@@ -446,11 +449,14 @@ def fetch_dashboard_data() -> dict:
         })
         prev_revenue = revenue
 
-    month_forecast = forecast.forecast(
-        {r["day"]: (float(r["revenue"] or 0), int(r["customers"])) for r in daily_rows},
-        {s["month"]: s["cust"] for s in series},
-        date.fromisoformat(today_ct),
-    )
+    daily = {r["day"]: (float(r["revenue"] or 0), int(r["customers"])) for r in daily_rows}
+    today = date.fromisoformat(today_ct)
+    # The model runs once per morning (scripts/forecast_snapshots.py); until
+    # today's run is stored the weekday means stand in, and one is started.
+    if today not in snapshots:
+        forecast_snapshots.ensure_in_background()
+    month_forecast = forecast.forecast(daily, {s["month"]: s["cust"] for s in series}, today, snapshots)
+    forecast_history = forecast.daily_history(daily, today, snapshots=snapshots) if month_forecast else []
 
     revenue_today = sum(float(r["total_amount"] or 0) for r in txn_today)
     customers_today = len({r["cust_key"] for r in txn_today})
@@ -473,6 +479,7 @@ def fetch_dashboard_data() -> dict:
         "weekday": weekday_matrix(weekday_rows, today_ct),
         "heatmap": year_heatmap(daily_rows, date.fromisoformat(today_ct)),
         "forecast": month_forecast,
+        "forecast_history": forecast_history,
         "lapsed": [dict(r) for r in lapsed],
         "insights": insights,
         "ai_report": ai_report,
@@ -576,15 +583,187 @@ def render_forecast(fc: dict) -> str:
         accuracy = (f" Aralık: aynı yöntem son {len(fc['backtests'])} ayda ayın aynı gününde uygulandığında ay sonunu "
                     f"ne kadar ıskaladığına göre; ortalama ıskalama ciroda %{fc['revenueMape'] * 100:.0f}"
                     + (f", müşteride %{fc['customersMape'] * 100:.0f}." if fc["customersMape"] is not None else "."))
-    method = ("Nasıl hesaplanıyor: bu ayın şu ana kadarki cirosuna, kalan her gün için son 4 haftada haftanın aynı "
-              "gününde kazanılan ortalama ekleniyor (kapalı günler $0 sayılır). Müşteri tahmini aynı yolla, ziyaretten "
-              "farklı müşteriye son 3 ayın oranıyla çevriliyor." + accuracy)
+    if fc.get("model") == "snapshot":
+        how = ("Nasıl hesaplanıyor: bu ayın şu ana kadarki cirosuna, kalan her gün için iki tahmin modelinin "
+               "(ETS/Holt-Winters ve Prophet) ortalaması ekleniyor; modeller her sabah tüm geçmiş günlük cirodan "
+               "haftanın günü düzenini ve büyüme trendini öğreniyor (kapalı günler $0 sayılır). Müşteri tahmini son 4 "
+               "haftanın haftanın günü ortalamasıyla yapılıp ziyaretten farklı müşteriye son 3 ayın oranıyla çevriliyor.")
+    else:
+        how = ("Nasıl hesaplanıyor: bu ayın şu ana kadarki cirosuna, kalan her gün için son 4 haftada haftanın aynı "
+               "gününde kazanılan ortalama ekleniyor (kapalı günler $0 sayılır). Müşteri tahmini aynı yolla, ziyaretten "
+               "farklı müşteriye son 3 ayın oranıyla çevriliyor.")
+    method = how + accuracy
     return (
         f'<div class="panel fc-panel"><p class="panel-title">{name} Ay Sonu Tahmini</p>'
         f'<div class="stat-row">{"".join(tiles)}</div>'
         + (f'<p class="fc-target">{html.escape(target)}</p>' if target else "")
         + f'<p class="panel-sub">{html.escape(method)}</p></div>'
     )
+
+
+def forecast_history_json(history: list[dict]) -> str:
+    """The daily forecast history for the chart, oldest month first."""
+    return json.dumps([
+        {
+            "month": h["month"], "name": month_name(h["month"]), "final": h["finalRevenue"],
+            "days": [{
+                "day": p["day"].day,
+                "label": f"{p['day'].day} {MONTH_LABELS_TR[p['day'].strftime('%m')]} {WEEKDAYS_TR[p['day'].weekday()]}",
+                "revenue": round(p["revenue"], 2),
+                "change": None if p["change"] is None else round(p["change"], 2),
+                "changePct": None if p["changePct"] is None else round(p["changePct"] * 100, 2),
+            } for p in h["days"]],
+        }
+        for h in reversed(history)
+    ])
+
+
+def render_forecast_history(history: list[dict]) -> str:
+    """Panel with the month-end forecast replayed day by day; filled in by
+    FORECAST_HISTORY_JS."""
+    if not history:
+        return ""
+    active = ' class="active"'
+    buttons = "".join(
+        f'<button type="button" data-fch-month="{i}"{active if i == len(history) - 1 else ""}>'
+        f"{html.escape(month_name(h['month']))}</button>"
+        for i, h in enumerate(reversed(history))
+    )
+    return (
+        '<div class="panel" id="fch">'
+        '<p class="panel-title">Ay Sonu Ciro Tahmininin Günlük Seyri</p>'
+        '<p class="panel-sub">Her nokta, o günün sabahında, yalnızca o güne kadarki ödemelerle yapılan ay sonu '
+        "tahmini (üstteki kartta anlatılan yöntemle); böylece tahminin günden güne nasıl değiştiğini görürsünüz. "
+        "Üstteki kart gün içindeki ödemelerle "
+        "anlık güncellenir, bu grafikte bugünün noktası ise sabahki tahmindir. Bir noktaya dokunun: önceki güne "
+        "göre değişim $ ve % olarak görünür. Biten aylarda kesik çizgi ayın gerçekleşen cirosudur; tabloda her günün "
+        "tahmininin gerçekleşenden farkı da yazar (+: tahmin fazlaydı, −: azdı; yeşil: %5'ten az sapma, kırmızı: "
+        "%15 ya da fazla).</p>"
+        f'<div class="wd-toggle fch-toggle">{buttons}</div>'
+        '<canvas id="chart-fc-history"></canvas>'
+        '<p class="fch-summary" id="fch-summary"></p>'
+        '<details class="collapsible fch-details"><summary>Günlük tablo</summary>'
+        '<div class="table-wrap"><table><thead id="fch-head"></thead><tbody id="fch-body"></tbody></table></div>'
+        "</details></div>"
+    )
+
+
+FORECAST_HISTORY_JS = """
+(function () {
+  const canvas = document.getElementById("chart-fc-history");
+  if (!canvas || !FORECAST_HISTORY.length) return;
+  const money = v => "$" + Math.round(v).toLocaleString("en-US");
+  const signed = v => Math.round(v) === 0 ? "$0" : (v > 0 ? "+" : "−") + money(Math.abs(v));
+  const pct = v => Math.abs(v) < 0.05 ? "0.0%" : (v > 0 ? "+" : "−") + Math.abs(v).toFixed(1) + "%";
+  const cls = v => Math.round(v) > 0 ? "stat-good" : (Math.round(v) < 0 ? "stat-bad" : "");
+  let month = FORECAST_HISTORY[FORECAST_HISTORY.length - 1];
+  // How far a morning's forecast was from the month's final revenue, in %.
+  const miss = d => (d.revenue - month.final) / month.final * 100;
+  const missCls = v => Math.abs(v) <= 5 ? "stat-good" : (Math.abs(v) >= 15 ? "stat-bad" : "");
+  const chart = new Chart(canvas, {
+    type: "line",
+    data: { labels: [], datasets: [] },
+    options: {
+      responsive: true,
+      interaction: { mode: "index", intersect: false },
+      plugins: {
+        legend: { display: true, position: "top", align: "start",
+                  labels: { boxWidth: 10, boxHeight: 10, font: { size: 11.5 } } },
+        tooltip: {
+          backgroundColor: "#0b0b0b", padding: 10, cornerRadius: 8,
+          callbacks: {
+            title: items => month.days[items[0].dataIndex].label,
+            label: ctx => ctx.dataset.label + ": " + money(ctx.parsed.y),
+            footer: items => {
+              const d = month.days[items[0].dataIndex], lines = [];
+              if (d.change !== null) {
+                lines.push("Önceki güne göre: " + signed(d.change) + (d.changePct === null ? "" : " (" + pct(d.changePct) + ")"));
+              }
+              if (month.final) lines.push("Gerçekleşene göre fark: " + pct(miss(d)));
+              return lines;
+            }
+          }
+        }
+      },
+      scales: {
+        x: { grid: { display: false }, ticks: { font: { size: 10.5 } } },
+        y: { grid: { color: "#e4e2dc" },
+             ticks: { font: { size: 10.5 }, callback: v => "$" + v.toLocaleString("en-US") } }
+      }
+    }
+  });
+
+  function show(m) {
+    month = m;
+    const datasets = [{
+      label: "Ay sonu tahmini", data: m.days.map(d => d.revenue), borderColor: "#2a78d6",
+      backgroundColor: "#2a78d6", pointRadius: 3, pointHoverRadius: 5, borderWidth: 2, tension: 0.2
+    }];
+    if (m.final !== null) {
+      datasets.push({
+        label: "Gerçekleşen", data: m.days.map(() => m.final), borderColor: "#1baf7a",
+        backgroundColor: "#1baf7a", borderDash: [6, 4], borderWidth: 1.5, pointRadius: 0, pointHoverRadius: 0
+      });
+    }
+    chart.data.labels = m.days.map(d => d.day);
+    chart.data.datasets = datasets;
+    chart.update();
+
+    const first = m.days[0], last = m.days[m.days.length - 1];
+    let text = first.label + " sabahı tahmin " + money(first.revenue) + ", " + last.label + " sabahı "
+      + money(last.revenue) + (first.revenue && last !== first
+        ? ": ilk günden bu yana " + pct((last.revenue - first.revenue) / first.revenue * 100) : "") + ".";
+    if (m.final === null && last.change !== null) {
+      text += " Dünden bugüne: " + signed(last.change) + (last.changePct === null ? "" : " (" + pct(last.changePct) + ")") + ".";
+    }
+    if (m.final) {
+      const avg = m.days.reduce((s, d) => s + Math.abs(miss(d)), 0) / m.days.length;
+      text += " Gerçekleşen ciro " + money(m.final) + "; ayın ilk günkü tahmin farkı " + pct(miss(first))
+        + ", ay boyunca ortalama sapma %" + avg.toFixed(1) + ".";
+    }
+    document.getElementById("fch-summary").textContent = text;
+
+    const head = document.getElementById("fch-head");
+    const cols = ["Gün", "Tahmin", "Önceki güne göre", "Değişim %"]
+      .concat(m.final ? ["Gerçekleşen", "Gerçekleşene göre fark"] : []);
+    head.innerHTML = "";
+    const htr = document.createElement("tr");
+    cols.forEach(c => { const th = document.createElement("th"); th.textContent = c; htr.appendChild(th); });
+    head.appendChild(htr);
+
+    const body = document.getElementById("fch-body");
+    body.innerHTML = "";
+    for (const d of m.days.slice().reverse()) {
+      const tr = document.createElement("tr");
+      const add = (text, className) => {
+        const td = document.createElement("td");
+        td.textContent = text;
+        if (className) td.className = className;
+        tr.appendChild(td);
+      };
+      const changeCls = d.change === null ? "" : cls(d.change);
+      add(d.label);
+      add(money(d.revenue));
+      add(d.change === null ? "—" : signed(d.change), changeCls);
+      add(d.changePct === null ? "—" : pct(d.changePct),
+          d.changePct === null || Math.abs(d.changePct) < 0.05 ? "" : changeCls);
+      if (m.final) {
+        add(money(m.final));
+        add(pct(miss(d)), missCls(miss(d)));
+      }
+      body.appendChild(tr);
+    }
+  }
+
+  document.querySelectorAll("[data-fch-month]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      document.querySelectorAll("[data-fch-month]").forEach(b => b.classList.toggle("active", b === btn));
+      show(FORECAST_HISTORY[+btn.dataset.fchMonth]);
+    });
+  });
+  show(month);
+})();
+"""
 
 
 def render_year_heatmap(hm: dict) -> str:
@@ -919,6 +1098,11 @@ def render_html(data: dict) -> str:
   .fc-target {{ font-size: 12.5px; margin: 0 0 8px; }}
   tr.fc-row td {{ background: #eef6ee; font-style: italic; }}
   tr.fc-row small {{ display: block; font-size: 10.5px; color: var(--text-muted); font-style: normal; }}
+  .fch-toggle {{ background: var(--surface-1); flex-wrap: wrap; }}
+  .fch-summary {{ font-size: 12px; margin: 8px 0 6px; color: var(--text-secondary); }}
+  .fch-details summary {{ font-size: 12px; font-weight: 600; color: var(--text-secondary); margin: 0 0 8px; }}
+  .fch-details summary::before {{ content: "▶ "; font-size: 9px; color: var(--text-muted); }}
+  .fch-details[open] summary::before {{ content: "▼ "; }}
   .hm-scroll {{ overflow-x: auto; padding-bottom: 4px; }}
   .hm-grid {{ display: grid; grid-template-columns: 26px repeat(53, 12px); grid-template-rows: 14px repeat(7, 12px);
     gap: 3px; width: max-content; }}
@@ -1023,6 +1207,7 @@ def render_html(data: dict) -> str:
 
   <p class="section-title">Aylık Büyüme</p>
   {render_forecast(fc) if fc else ''}
+  {render_forecast_history(data.get('forecast_history') or [])}
 
   <div class="panel">
     <p class="panel-title">Aylık Ciro</p>
@@ -1087,6 +1272,7 @@ const REPEAT_REV = {repeat_rev_json};
 const AVG_TICKET = {avg_ticket_json};
 const MOM = {mom_json};
 const FORECAST = {forecast_js};
+const FORECAST_HISTORY = {forecast_history_json(data.get('forecast_history') or [])};
 const LAPSED = {lapsed_json};
 
 // --- Lapsed-customer table: sortable (multi-key via shift-click), searchable ---
@@ -1255,6 +1441,7 @@ new Chart(document.getElementById("chart-mom"), {{
 
 bar("chart-avgticket", "Ortalama İşlem ($)", AVG_TICKET, "#eb6834");
 </script>
+<script>{FORECAST_HISTORY_JS}</script>
 <script>{WEEKDAY_TOGGLE_JS}</script>
 <script>{HEATMAP_JS}</script>
 </body>
