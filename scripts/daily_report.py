@@ -354,6 +354,37 @@ def collect_facts(today: date) -> list[Fact]:
     add("winback.overdue", "Kendi her zamanki gelme aralığını geçmiş, randevusu olmayan, SMS ile ulaşılabilen düzenli "
         "müşteri (panelde 'Her Zamanki Aralığını Geçen Düzenli Müşteriler' listesi)", len(overdue), str(len(overdue)))
 
+    # Levers from the panel's action lists (sms_campaign/insights.py).
+    acts = data.get("actions") or {}
+    if acts.get("visitors"):
+        share = acts["rebooked"] / acts["visitors"] * 100
+        add("rebook.rate", f"Son 7 günde gelen {acts['visitors']} müşteriden ileri tarihli randevusu olan "
+            f"({acts['rebooked']} kişi); ödeme sırasında sonraki randevuyu vermek bunu artırır", round(share),
+            f"%{share:.0f}")
+    winback = next((r for r in acts.get("scorecard", []) if r["type"] == "Campaign"), None)
+    if winback and winback["rate"] is not None and winback["baseline"] is not None:
+        add("sms.winback.rate", "Son 120 günde geri kazanma SMS'i alan müşterilerin 14 gün içinde gelme oranı",
+            round(winback["rate"] * 100), f"%{winback['rate'] * 100:.0f}")
+        add("sms.winback.baseline", "Aynı durumda (60–365 gündür gelmeyen) ama SMS almayan müşterilerin 14 gün "
+            "içinde gelme oranı", round(winback["baseline"] * 100, 1), f"%{winback['baseline'] * 100:.1f}")
+    full_leak = [(m, v) for m, v in sorted((acts.get("leakage") or {}).items()) if m < today.strftime("%Y-%m")]
+    if full_leak:
+        m, v = full_leak[-1]
+        add("cancel.lost", f"{month_name(m)} iptal edilen ya da silinen hizmetlerden müşterisi 14 gün içinde geri "
+            "gelmeyen", v["lost"], str(v["lost"]))
+        add("cancel.lost_value", f"{month_name(m)} bu kayıp iptallerin tutarı", round(v["lostValue"]),
+            money(v["lostValue"]))
+    if acts.get("lostCancels"):
+        n = len(acts["lostCancels"])
+        add("cancel.lost_list", "İptal ettikten sonra hiç gelmemiş, randevusu olmayan müşteri (son 120 gün; panelde "
+            "'İptal Kaybı' bölümündeki 'Geri gelmeyen iptaller' listesi)", n, str(n))
+    week = acts.get("week") or []
+    if week and week[0]["ratio"] is not None and week[0]["ratio"] < 1:
+        w = week[0]
+        add("week.softest_day", f"Önümüzdeki 7 günde hedefe göre en boş beklenen gün ({w['day'].isoformat()}, "
+            f"{live_dashboard.WEEKDAY_NAMES_TR[w['day'].weekday()]}); tahminin o gün beklediği ciro", round(w["expected"]),
+            money(w["expected"]))
+
     # Spend per visit: a visit is one customer's payments on one day (a
     # payment row is one service), for the last two full months.
     full_mix = [s for s in data["series"] if not s["partial"] and s.get("visitMix", {}).get("perVisit")]
@@ -495,6 +526,10 @@ and regulars past their usual rhythm (winback.overdue), both listed on the panel
 in the next 7 days (next7.*); and, when services per visit fell (visit.lines*), offering a second service at \
 checkout. Merge the other forecast and month-to-date facts into this item instead of writing separate items \
 about the same shortfall. Keep the report to at most 3 actions in total.
+- Supporting levers, to use inside the items above rather than as items of their own unless they clearly show a \
+problem: rebook.rate (giving the next appointment at checkout is fully in the owner's hands), sms.winback.rate \
+against sms.winback.baseline (how much the win-back texts bring people back; a good result belongs in good), \
+cancel.lost* (cancellations that never came back) and week.softest_day (the day with the most room to fill).
 - A "visit" (ziyaret) is one customer's payments on one day; a payment row (işlem) is one service. Never mix \
 the two words.
 - When fc.on_track or fc.prev_beaten exists, the month is heading past last month: say so in good, and say what \

@@ -27,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import psycopg  # noqa: E402
 
-from sms_campaign import forecast  # noqa: E402
+from sms_campaign import forecast, insights  # noqa: E402
 from sms_campaign.db import get_connection  # noqa: E402
 
 import forecast_snapshots  # noqa: E402  (scripts/, next to this file)
@@ -163,6 +163,133 @@ def fetch_overdue(conn, today: str) -> list[dict]:
         + REACHABLE_SQL + " ORDER BY (%(today)s::date - f.last) / r.usual, f.spent DESC",
         {"today": today, "k": SHRINK_VISITS, "factor": OVERDUE_FACTOR},
     ).fetchall()]
+
+
+SV_DAY_SQL = "(service_date::timestamptz AT TIME ZONE 'America/Chicago')"
+SV_ISO_SQL = "service_date ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T'"
+SV_ACTIVE_SQL = "COALESCE(booking_status, '') NOT IN ('Cancel', 'Deleted')"
+
+
+def fetch_action_data(conn, today: str) -> dict:
+    """Rows behind the action lists and scorecards (sms_campaign/insights.py)."""
+    q = lambda sql, params=None: [dict(r) for r in conn.execute(sql, params or {}).fetchall()]  # noqa: E731
+    return {
+        # Everyone on today's calendar; customers not synced yet keep their
+        # Vagaro appointment as their key.
+        "today": q(
+            f"SELECT COALESCE(s.customer_id::text, 'appt-' || s.vagaro_appt_id) AS key, s.customer_id, "
+            "COALESCE(NULLIF(TRIM(CONCAT_WS(' ', cu.first_name, cu.last_name)), ''), '—') AS name, "
+            f"to_char({SV_DAY_SQL}, 'HH24:MI') AS time, s.service_name, COALESCE(s.booking_status, '') AS status "
+            f"FROM services s LEFT JOIN customers cu USING (customer_id) WHERE {SV_ISO_SQL} "
+            f"AND {SV_DAY_SQL}::date = %(today)s", {"today": today}),
+        "history": q(
+            f"SELECT customer_id::text AS customer_id, {SV_DAY_SQL}::date AS day, service_name FROM services "
+            f"WHERE {SV_ISO_SQL} AND booking_status = 'Service Completed' AND customer_id IS NOT NULL "
+            f"AND {SV_DAY_SQL}::date < %(today)s", {"today": today}),
+        "future": q(
+            f"SELECT customer_id::text AS customer_id, MIN({SV_DAY_SQL}::date) AS day FROM services "
+            f"WHERE {SV_ISO_SQL} AND {SV_ACTIVE_SQL} AND customer_id IS NOT NULL "
+            f"AND {SV_DAY_SQL}::date > %(today)s GROUP BY 1", {"today": today}),
+        "booked": q(
+            f"SELECT {SV_DAY_SQL}::date AS day, COUNT(DISTINCT COALESCE(customer_id::text, vagaro_appt_id)) AS n "
+            f"FROM services WHERE {SV_ISO_SQL} AND {SV_ACTIVE_SQL} "
+            f"AND {SV_DAY_SQL}::date BETWEEN %(today)s::date + 1 AND %(today)s::date + 7 GROUP BY 1", {"today": today}),
+        "cancels": q(
+            f"SELECT s.customer_id::text AS customer_id, {SV_DAY_SQL}::date AS day, s.amount_paid AS amount, "
+            "s.service_name, COALESCE(NULLIF(TRIM(CONCAT_WS(' ', cu.first_name, cu.last_name)), ''), '—') AS name, "
+            "cu.mobile FROM services s LEFT JOIN customers cu USING (customer_id) "
+            f"WHERE {SV_ISO_SQL} AND s.booking_status IN ('Cancel', 'Deleted') "
+            f"AND {SV_DAY_SQL}::date BETWEEN %(today)s::date - 120 AND %(today)s", {"today": today}),
+        "visits": q(
+            "WITH " + VISITS_CTE + " SELECT customer_id::text AS customer_id, dt AS day, amt::float AS amount "
+            "FROM v WHERE dt < %(today)s", {"today": today}),
+        "sends": q(
+            "SELECT customer_id::text AS customer_id, campaign_type, "
+            "(sent_at::timestamptz AT TIME ZONE 'America/Chicago')::date AS day FROM sms_history "
+            "WHERE status IN ('sent', 'delivered') AND customer_id IS NOT NULL "
+            "AND sent_at::timestamptz >= %(today)s::date - 120", {"today": today}),
+    }
+
+
+def fetch_kpi_history(conn) -> list[dict]:
+    """Stored daily values (kpi_snapshots); empty if the table doesn't exist."""
+    try:
+        with conn.transaction():
+            return [dict(r) for r in conn.execute(
+                "SELECT snap_date, key, value FROM kpi_snapshots WHERE snap_date >= CURRENT_DATE - 60").fetchall()]
+    except psycopg.Error:
+        return []
+
+
+def store_kpis(today: date, values: dict[str, float]) -> None:
+    """Keep today's values once (the first computed wins)."""
+    # get_connection() has already opened a transaction (search_path), so a
+    # `with conn.transaction()` block would only be a savepoint: commit.
+    conn = get_connection()
+    try:
+        for key, value in values.items():
+            conn.execute("INSERT INTO kpi_snapshots (snap_date, key, value) VALUES (%s, %s, %s) "
+                         "ON CONFLICT (snap_date, key) DO NOTHING", (today, key, value))
+        conn.commit()
+    except psycopg.Error as exc:
+        print(f"kpi snapshot failed: {exc}", file=sys.stderr)
+    finally:
+        conn.close()
+
+
+def build_actions(rows: dict, kpi_history: list[dict], today: date, fc: dict | None, snapshots: dict) -> dict:
+    """Today's customers, rebooking, cancellations, SMS results and the
+    coming week, from fetch_action_data's rows; stores today's rebook rate
+    and bookings once a day."""
+    visit_days: dict[str, list[date]] = {}
+    for v in rows["visits"]:
+        visit_days.setdefault(v["customer_id"], []).append(v["day"])
+    gaps = []
+    for days in visit_days.values():
+        days.sort()
+        gaps += [(b - a).days for a, b in zip(days, days[1:])]
+    typical_gap = statistics.median(gaps) if gaps else 35
+    future = {r["customer_id"]: r["day"] for r in rows["future"]}
+
+    since = today - timedelta(days=180)
+    attach = insights.attach_rates([r for r in rows["history"] if r["day"] >= since])
+    today_rows = [{**r, "customer_id": r["key"]} for r in rows["today"]]
+    customers_today = insights.todays_customers(today_rows, rows["history"], future, typical_gap, attach)
+
+    recent = {v["customer_id"] for v in rows["visits"] if today - timedelta(days=7) <= v["day"] < today}
+    rebooked, visitors = insights.rebook_rate(recent, future)
+
+    cancels = [{**r, "amount": float(r["amount"] or 0)} for r in rows["cancels"]]
+    leakage = insights.cancel_leakage(cancels, visit_days, today)
+    lost_cancels = insights.lost_cancellations(cancels, visit_days, future, today)
+    scorecard = insights.campaign_scorecard(rows["sends"], rows["visits"], today)
+
+    booked = {r["day"]: r["n"] for r in rows["booked"]}
+    expected: list[tuple[date, float]] = []
+    snap = snapshots.get(today)
+    for i in range(1, 8):
+        d = today + timedelta(days=i)
+        if d.month != today.month:
+            break
+        if snap and i < len(snap["days"]):
+            expected.append((d, snap["days"][i]))
+    week = insights.soft_days(expected, fc.get("todayTarget") if fc else None, booked)
+
+    # Kept daily: these can't be replayed later.
+    stored = {(r["snap_date"], r["key"]) for r in kpi_history}
+    if (today, "rebook.visitors") not in stored:
+        values = {"rebook.rebooked": rebooked, "rebook.visitors": visitors}
+        values.update({f"booked:{d.isoformat()}": n for d, n in booked.items()})
+        store_kpis(today, values)
+    rebook_history = sorted(
+        (r["snap_date"], r["value"]) for r in kpi_history if r["key"] == "rebook.rebooked")
+    visitors_by_day = {r["snap_date"]: r["value"] for r in kpi_history if r["key"] == "rebook.visitors"}
+    return {
+        "customers": customers_today, "typicalGap": typical_gap,
+        "rebooked": rebooked, "visitors": visitors,
+        "rebookHistory": [(d, v / visitors_by_day[d]) for d, v in rebook_history if visitors_by_day.get(d)],
+        "leakage": leakage, "lostCancels": lost_cancels, "scorecard": scorecard, "week": week,
+    }
 
 
 def fetch_daily_rows(conn) -> list[dict]:
@@ -441,6 +568,8 @@ def fetch_dashboard_data() -> dict:
         visit_mix = fetch_visit_mix(conn)
         second_visit = fetch_second_visit(conn, today_ct)
         overdue = fetch_overdue(conn, today_ct)
+        action_rows = fetch_action_data(conn, today_ct)
+        kpi_history = fetch_kpi_history(conn)
 
         # Valuable customers who haven't come back yet -- stays on the list
         # until a new transaction updates their last_visit forward, at which
@@ -570,6 +699,8 @@ def fetch_dashboard_data() -> dict:
     for s in series:
         s["visitMix"] = mix.get(s["month"], {})
 
+    actions = build_actions(action_rows, kpi_history, today, month_forecast, snapshots)
+
     revenue_today = sum(float(r["total_amount"] or 0) for r in txn_today)
     customers_today = len({r["cust_key"] for r in txn_today})
     avg_per_customer_today = (revenue_today / customers_today) if customers_today else 0.0
@@ -595,6 +726,7 @@ def fetch_dashboard_data() -> dict:
         "mom": mom,
         "second_visit": second_visit,
         "overdue": overdue,
+        "actions": actions,
         "lapsed": [dict(r) for r in lapsed],
         "insights": insights,
         "ai_report": ai_report,
@@ -661,36 +793,99 @@ def pct_change(new: float, old: float | None) -> str:
     return f"%{abs(p):.0f} {'artış' if p >= 0 else 'düşüş'}" if round(p) else "değişim yok"
 
 
+OPEN_HOUR, CLOSE_HOUR = 9, 20  # most payments fall between these (Chicago)
+
+
+def pace_state(done: float, expected: float | None) -> str:
+    """good: on or ahead of where it should be by now; warn: within 10%;
+    bad: further behind."""
+    if expected is None or expected <= 0:
+        return "good" if done > 0 else "neutral"
+    ratio = done / expected
+    return "good" if ratio >= 1 else "warn" if ratio >= 0.9 else "bad"
+
+
+def pbar(frac: float, state: str, mark: float | None = None, band: tuple[float, float] | None = None,
+         note: str = "") -> str:
+    """A progress bar toward a target (frac = value / target). mark: where it
+    should be by now; band: a range (e.g. the forecast's), all as fractions
+    of the target."""
+    clamp = lambda x: max(0.0, min(1.0, x)) * 100  # noqa: E731
+    parts = [f'<span class="pb-fill pb-{state}" style="width:{clamp(frac):.0f}%"></span>']
+    if band:
+        parts.insert(0, f'<span class="pb-band" style="left:{clamp(band[0]):.0f}%;'
+                        f'width:{max(0.0, clamp(band[1]) - clamp(band[0])):.0f}%"></span>')
+    if mark is not None:
+        parts.append(f'<span class="pb-mark" style="left:{clamp(mark):.0f}%"></span>')
+    return (f'<div class="pb" title="{html.escape(note)}">' + "".join(parts) + "</div>"
+            + (f'<div class="pb-note pb-{state}-text">{html.escape(note)}</div>' if note else ""))
+
+
+def day_elapsed(now: datetime) -> float:
+    """Share of the business day gone by (0 before opening, 1 after closing)."""
+    hours = now.hour + now.minute / 60
+    return max(0.0, min(1.0, (hours - OPEN_HOUR) / (CLOSE_HOUR - OPEN_HOUR)))
+
+
 def render_forecast(fc: dict) -> str:
     """Month-end forecast card; the method is in src/sms_campaign/forecast.py."""
     name, prev = month_name(fc["month"]), month_name(fc["prevMonth"])
+    now = datetime.now(ZoneInfo("America/Chicago"))
+    prev_rev, prev_cust_n = fc["prevRevenue"], fc["prevCustomers"]
+
+    def goal_bar(value: float, goal: float | None, low: float, high: float, unit: str) -> str:
+        """Month-end forecast against last month: the bar ends at last month."""
+        if not goal:
+            return ""
+        frac = value / goal
+        state = pace_state(value, goal)
+        fmt = (lambda v: f"${v:,.0f}") if unit == "$" else (lambda v: f"{v:.0f}")
+        note = (f"{prev}'i geçiyor ✓ (+{fmt(value - goal)})" if frac >= 1
+                else f"{prev}'in %{frac * 100:.0f}'i · {fmt(goal - value)} eksik")
+        return pbar(frac, state, band=(low / goal, high / goal), note=note)
+
     tiles = [
         '<div class="stat-tile"><div class="stat-label">Ay sonu ciro tahmini</div>'
         f'<div class="stat-value">${fc["revenue"]:,.0f}</div>'
         f'<div class="stat-sub">olası aralık ${fc["revenueLow"]:,.0f} – ${fc["revenueHigh"]:,.0f}</div>'
-        f'<div class="stat-sub">{prev}: ${fc["prevRevenue"]:,.0f} · {pct_change(fc["revenue"], fc["prevRevenue"])}</div></div>'
+        f'<div class="stat-sub">{prev}: ${prev_rev:,.0f} · {pct_change(fc["revenue"], prev_rev)}</div>'
+        + goal_bar(fc["revenue"], prev_rev, fc["revenueLow"], fc["revenueHigh"], "$") + "</div>"
     ]
     if fc["customers"] is not None:
-        prev_cust = (f'<div class="stat-sub">{prev}: {fc["prevCustomers"]} · '
-                     f'{pct_change(fc["customers"], fc["prevCustomers"])}</div>') if fc["prevCustomers"] else ""
+        prev_cust = (f'<div class="stat-sub">{prev}: {prev_cust_n} · '
+                     f'{pct_change(fc["customers"], prev_cust_n)}</div>') if prev_cust_n else ""
         tiles.append(
             '<div class="stat-tile"><div class="stat-label">Ay sonu farklı müşteri tahmini</div>'
             f'<div class="stat-value">{fc["customers"]:.0f}</div>'
-            f'<div class="stat-sub">olası aralık {fc["customersLow"]:.0f} – {fc["customersHigh"]:.0f}</div>{prev_cust}</div>'
+            f'<div class="stat-sub">olası aralık {fc["customersLow"]:.0f} – {fc["customersHigh"]:.0f}</div>{prev_cust}'
+            + goal_bar(fc["customers"], prev_cust_n, fc["customersLow"], fc["customersHigh"], "n") + "</div>"
         )
+    # So far against last month, with a mark where an even pace would be by now.
+    month_bar = ""
+    if prev_rev:
+        pace = (fc["daysElapsed"] - 1 + day_elapsed(now)) / fc["daysInMonth"]
+        frac = fc["actualRevenue"] / prev_rev
+        state = pace_state(fc["actualRevenue"], prev_rev * pace)
+        note = (f"{prev}'in %{frac * 100:.0f}'i yapıldı · bu tempoda %{pace * 100:.0f} olmalıydı"
+                if frac < 1 else f"{prev} geçildi ✓")
+        month_bar = pbar(frac, state, mark=pace, note=note)
     tiles.append(
         '<div class="stat-tile"><div class="stat-label">Şu ana kadar</div>'
         f'<div class="stat-value">${fc["actualRevenue"]:,.0f}</div>'
-        f'<div class="stat-sub">{fc["daysElapsed"]} / {fc["daysInMonth"]} gün · {fc["actualCustomers"]} müşteri</div></div>'
+        f'<div class="stat-sub">{fc["daysElapsed"]} / {fc["daysInMonth"]} gün · {fc["actualCustomers"]} müşteri</div>'
+        + month_bar + "</div>"
     )
     if fc.get("todayTarget"):
         done = fc["todayRevenue"] / fc["todayTarget"]
+        elapsed = day_elapsed(now)
+        state = "good" if done >= 1 else pace_state(fc["todayRevenue"], fc["todayTarget"] * elapsed)
+        note = ("hedef tuttu ✓" if done >= 1 else
+                f"saat {now:%H:%M} itibarıyla %{elapsed * 100:.0f} olmalıydı" if elapsed > 0 else "gün başlamadı")
         tiles.append(
             '<div class="stat-tile"><div class="stat-label">Bugünün hedefi</div>'
             f'<div class="stat-value">${fc["todayTarget"]:,.0f}</div>'
-            f'<div class="stat-sub">şu ana kadar ${fc["todayRevenue"]:,.0f} · %{done * 100:.0f}'
-            + (" ✓" if done >= 1 else "") + "</div>"
-            f'<div class="fc-bar"><span style="width:{min(100.0, done * 100):.0f}%"></span></div></div>'
+            f'<div class="stat-sub">şu ana kadar ${fc["todayRevenue"]:,.0f} · %{done * 100:.0f}</div>'
+            + pbar(done, state, mark=elapsed if 0 < elapsed < 1 else None, note=note) + "</div>"
         )
     expected = fc.get("expectedPerOpenDay")
     if fc["prevRevenue"] and fc["actualRevenue"] >= fc["prevRevenue"]:
@@ -898,6 +1093,95 @@ FORECAST_HISTORY_JS = """
   show(month);
 })();
 """
+
+
+def _table(head: list[str], rows: list[list[str]], empty: str = "Yok", cls: str = "") -> str:
+    body = "".join("<tr>" + "".join(f"<td>{c}</td>" for c in r) + "</tr>" for r in rows)
+    return (f'<div class="table-wrap"><table class="{cls}"><thead><tr>' + "".join(f"<th>{h}</th>" for h in head)
+            + f'</tr></thead><tbody>{body or f"<tr><td colspan={len(head)}>{empty}</td></tr>"}</tbody></table></div>')
+
+
+def render_today_customers(acts: dict) -> str:
+    """Everyone on today's calendar, with what to offer at checkout."""
+    rows = []
+    for p in acts.get("customers", []):
+        who = ('<span class="badge badge-new">ilk kez</span>' if p["first_time"]
+               else f'{p["visits_before"] + 1}. ziyaret')
+        nxt = (f'{p["next_booking"]:%d.%m}' if p["next_booking"]
+               else f'<span class="stat-bad">yok</span> · genelde {p["usual_gap"]} günde bir')
+        rows.append([
+            html.escape(p["time"]), html.escape(p["name"]) + (" ✓" if p["done"] else ""), who,
+            html.escape(", ".join(p["services"])),
+            html.escape(" · ".join(p["offers"])) or "—", nxt,
+        ])
+    return (
+        f'<p class="section-title">Bugünün Müşterileri ({len(rows)})</p>'
+        '<p class="panel-sub">Bugün takvimde olan herkes (randevusuz gelenler kaydedildiği anda eklenir; panel 2 '
+        "dakikada bir yenilenir). Ödeme sırasında: \"Öner\" sütunundaki hizmeti teklif edin (müşterinin daha önce "
+        "alıp bugün almadığı, yoksa bugünkü hizmetle en sık birlikte alınan hizmet) ve sonraki randevusu yoksa "
+        "verin. ✓ = hizmet tamamlandı.</p>"
+        + _table(["Saat", "Müşteri", "Kaçıncı", "Bugün", "Öner", "Sonraki randevu"], rows, "Bugün henüz kimse yok",
+                 cls="left")
+    )
+
+
+def render_week(acts: dict) -> str:
+    """The coming open days, weakest against the daily target first."""
+    rows = []
+    for w in acts.get("week", []):
+        state = "good" if w["ratio"] is None or w["ratio"] >= 1 else "warn" if w["ratio"] >= 0.85 else "bad"
+        rows.append([
+            f'{w["day"]:%d.%m} {WEEKDAYS_TR[w["day"].weekday()]}', f'${w["expected"]:,.0f}',
+            f'${w["target"]:,.0f}' if w["target"] else "—",
+            pbar(w["ratio"] or 0, state, note=f'hedefin %{(w["ratio"] or 0) * 100:.0f}\'i bekleniyor'),
+            str(w["booked"]),
+        ])
+    if not rows:
+        return ""
+    return (
+        '<div class="panel"><p class="panel-title">Önümüzdeki Günler: Hedefe Göre Beklenti</p>'
+        '<p class="panel-sub">Tahmin modelinin önümüzdeki açık günler için beklediği ciro, geçen ayı geçmek için '
+        "gereken günlük hedefle karşılaştırması; en zayıf gün üstte. Müşterilerin çoğu randevusuz ya da aynı gün "
+        "geldiği için alınmış randevu sayısı düşük görünür. En üstteki günler en çok boş kapasitesi olan günlerdir: "
+        "bu günlerden önceki akşam geri kazanma listelerindeki müşterilere mesaj atmak o günü doldurabilir.</p>"
+        + _table(["Gün", "Beklenen", "Gereken", "Durum", "Randevu"], rows) + "</div>"
+    )
+
+
+def render_losses_and_campaigns(acts: dict) -> str:
+    """Cancellations that didn't come back, and what each SMS type brings."""
+    leak_rows = []
+    for m, v in sorted((acts.get("leakage") or {}).items(), reverse=True)[:4]:
+        leak_rows.append([month_label(m), str(v["count"]), f'${v["value"]:,.0f}', str(v["lost"]),
+                          f'${v["lostValue"]:,.0f}', str(v["pending"]) if v["pending"] else "—"])
+    names = {"Campaign": "Geri kazanma (60+ / 100+ gün, indirimli)", "Review": "Yorum isteği",
+             "Birthday": "Doğum günü", "Reminder": "Hatırlatma (1 yıl)", "Announce": "Duyuru"}
+    sms_rows = []
+    for r in acts.get("scorecard", []):
+        base = (f'%{r["baseline"] * 100:.0f} <small>({r["baselineN"]} kişi)</small>'
+                if r["baseline"] is not None else "—")
+        sms_rows.append([html.escape(names.get(r["type"], r["type"])), str(r["texted"]),
+                         f'%{r["rate"] * 100:.0f}' if r["rate"] is not None else "—", base,
+                         f'${r["revenue"]:,.0f}'])
+    return (
+        '<details class="collapsible"><summary class="section-title">İptal Kaybı ve SMS Kampanya Karnesi</summary>'
+        '<p class="panel-sub"><b>İptal kaybı:</b> iptal edilen ya da silinen hizmetler (tutar: hizmetin fiyatı). '
+        "\"Kayıp\": müşteri 14 gün içinde gelmedi; aynı gün ya da sonra geldiyse randevu sadece değişmiştir. "
+        "Son 14 gün henüz belli değil (\"bekleyen\").</p>"
+        + _table(["Ay", "İptal/silinen", "Tutar", "Kayıp", "Kayıp tutar", "Bekleyen"], leak_rows)
+        + '<p class="panel-sub" style="margin-top:14px"><b>Geri gelmeyen iptaller:</b> iptal ettikten sonra hiç '
+        "gelmemiş ve randevusu olmayan müşteriler (son 120 gün, en yeni üstte); yeniden randevu için aranabilir.</p>"
+        + _table(["Müşteri", "Telefon", "İptal günü", "Hizmet"],
+                 [[html.escape(r["name"]), html.escape(r["mobile"] or "—"), f'{r["day"]:%d.%m.%Y}',
+                   html.escape(r["service_name"] or "—")] for r in acts.get("lostCancels", [])], cls="left")
+        + '<p class="panel-sub" style="margin-top:14px"><b>SMS karnesi (son 120 gün):</b> mesaj alanların ertesi '
+        "günden itibaren 14 gün içinde gelme oranı ve o ziyaretlerin cirosu. \"Mesajsız\": aynı gün 60–365 gündür "
+        "gelmeyen ama mesaj almayan müşterilerin gelme oranı; aradaki fark mesajın etkisine en yakın tahmin "
+        "(kesin değil: mesaj gönderilen müşteriler seçilerek gönderiliyor). Son 14 günün mesajları henüz "
+        "sayılmıyor.</p>"
+        + _table(["Kampanya", "Mesaj", "14 günde geldi", "Mesajsız", "Getirdiği ciro"], sms_rows)
+        + "</details>"
+    )
 
 
 def render_winback(second_visit: list[dict], overdue: list[dict]) -> str:
@@ -1171,6 +1455,36 @@ def render_html(data: dict) -> str:
     cum_json = json.dumps([s["cumCust"] for s in data["series"]])
     new_rev_json = json.dumps([s["newRev"] for s in data["series"]])
     repeat_rev_json = json.dumps([s["repeatRev"] for s in data["series"]])
+    # Bars under the top tiles: how far each is from where it should be.
+    now = datetime.now(ZoneInfo("America/Chicago"))
+    elapsed = day_elapsed(now)
+    top_bars = {"revenue": "", "appts": "", "services": "", "avg": "", "rebook": "", "rebook_value": "—"}
+    if fc and fc.get("todayTarget"):
+        target = fc["todayTarget"]
+        done = data["revenue_today"] / target
+        state = "good" if done >= 1 else pace_state(data["revenue_today"], target * elapsed)
+        top_bars["revenue"] = pbar(done, state, mark=elapsed if 0 < elapsed < 1 else None,
+                                   note=f"bugünün hedefi ${target:,.0f}'in %{done * 100:.0f}'i" + (" ✓" if done >= 1 else ""))
+    appts = data["appts_today"]
+    if appts["total"]:
+        left = appts["total"] - appts["done"]
+        top_bars["appts"] = pbar(appts["done"] / appts["total"], "neutral",
+                                 note=f"{left} müşteri bekliyor" if left else "hepsi tamamlandı ✓")
+    if appts["services"]:
+        top_bars["services"] = pbar(appts["services_done"] / appts["services"], "neutral")
+    last_full = next((s for s in reversed(data["series"]) if not s["partial"] and s["visitMix"].get("perVisit")), None)
+    if last_full and data["avg_per_customer_today"]:
+        ref = last_full["visitMix"]["perVisit"]
+        top_bars["avg"] = pbar(data["avg_per_customer_today"] / ref, pace_state(data["avg_per_customer_today"], ref),
+                               note=f"{month_name(last_full['month'])} ziyaret başı ${ref:,.2f}")
+    acts = data.get("actions") or {}
+    if acts.get("visitors"):
+        share = acts["rebooked"] / acts["visitors"]
+        top_bars["rebook_value"] = f"%{share * 100:.0f}"
+        top_bars["rebook"] = pbar(share, "neutral",
+                                  note=f"son 7 günde gelen {acts['visitors']} müşteriden {acts['rebooked']} kişinin "
+                                       "ileri tarihli randevusu var")
+
     def mix_json(key: str) -> str:
         return json.dumps([s["visitMix"].get(key) for s in data["series"]])
 
@@ -1227,6 +1541,9 @@ def render_html(data: dict) -> str:
   .table-wrap {{ overflow-x: auto; }}
   .badge {{ font-size: 10px; padding: 2px 6px; border-radius: 5px; white-space: nowrap; }}
   .badge-bad {{ background: #fbe4e4; color: var(--bad); }}
+  .badge-new {{ background: #fdf0d5; color: #a87310; }}
+  table.left th, table.left td {{ text-align: left; }}
+  td .pb {{ min-width: 90px; }}
   details.collapsible summary {{ cursor: pointer; list-style: none; }}
   details.collapsible summary::-webkit-details-marker {{ display: none; }}
   details.collapsible summary.section-title::before {{ content: "▶ "; font-size: 10px; color: var(--text-muted); }}
@@ -1267,8 +1584,16 @@ def render_html(data: dict) -> str:
   .wd-empty {{ color: var(--text-muted); }}
   .fc-panel .stat-tile {{ background: var(--surface-1); }}
   .fc-target {{ font-size: 12.5px; margin: 0 0 8px; }}
-  .fc-bar {{ height: 6px; background: var(--grid); border-radius: 3px; margin-top: 6px; overflow: hidden; }}
-  .fc-bar span {{ display: block; height: 100%; background: var(--good); }}
+  .pb {{ position: relative; height: 7px; background: var(--grid); border-radius: 4px; margin-top: 7px; overflow: hidden; }}
+  .pb span {{ position: absolute; top: 0; bottom: 0; left: 0; }}
+  .pb-fill {{ border-radius: 4px; }}
+  .pb-good {{ background: var(--good); }} .pb-warn {{ background: #e0a526; }} .pb-bad {{ background: var(--bad); }}
+  .pb-neutral {{ background: var(--series-1); }}
+  .pb-band {{ background: rgba(42, 120, 214, .18); }}
+  .pb-mark {{ width: 2px; background: var(--text-primary); }}
+  .pb-note {{ font-size: 10.5px; margin-top: 3px; }}
+  .pb-good-text {{ color: var(--good); }} .pb-warn-text {{ color: #a87310; }} .pb-bad-text {{ color: var(--bad); }}
+  .pb-neutral-text {{ color: var(--text-secondary); }}
   tr.fc-row td {{ background: #eef6ee; font-style: italic; }}
   tr.fc-row small {{ display: block; font-size: 10.5px; color: var(--text-muted); font-style: normal; }}
   .fch-toggle {{ background: var(--surface-1); flex-wrap: wrap; }}
@@ -1314,18 +1639,20 @@ def render_html(data: dict) -> str:
   </div>
 
   <div class="stat-row">
-    <div class="stat-tile"><div class="stat-label">Bugünkü Ciro</div><div class="stat-value">${data['revenue_today']:,.2f}</div></div>
+    <div class="stat-tile"><div class="stat-label">Bugünkü Ciro</div><div class="stat-value">${data['revenue_today']:,.2f}</div>{top_bars['revenue']}</div>
     <div class="stat-tile"><div class="stat-label">SMS (başarılı/başarısız)</div>
       <div class="stat-value"><span class="stat-good">{sms_ok}</span> / <span class="stat-bad">{sms_fail}</span></div>
       {f'<div class="stat-sub">{sms_pending} kuyrukta bekliyor</div>' if sms_pending else ''}</div>
     <div class="stat-tile"><div class="stat-label">Email Bugün</div><div class="stat-value">{data['email_today']}</div></div>
     <div class="stat-tile"><div class="stat-label">Randevu Bugün (gerçekleşen/toplam)</div>
-      <div class="stat-value"><span class="stat-good">{data['appts_today']['done']}</span> / {data['appts_today']['total']}</div></div>
+      <div class="stat-value"><span class="stat-good">{data['appts_today']['done']}</span> / {data['appts_today']['total']}</div>{top_bars['appts']}</div>
     <div class="stat-tile"><div class="stat-label">Hizmet Bugün (gerçekleşen/toplam)</div>
       <div class="stat-value"><span class="stat-good">{data['appts_today']['services_done']}</span> / {data['appts_today']['services']}</div>
-      {f'<div class="stat-sub">{data["appts_today"]["cancelled"]} iptal/silinen hariç</div>' if data['appts_today']['cancelled'] else ''}</div>
+      {f'<div class="stat-sub">{data["appts_today"]["cancelled"]} iptal/silinen hariç</div>' if data['appts_today']['cancelled'] else ''}{top_bars['services']}</div>
     <div class="stat-tile"><div class="stat-label">Yeni Opt-out</div><div class="stat-value">{data['optouts_today']}</div></div>
-    <div class="stat-tile"><div class="stat-label">Müşteri Başı Ortalama (Bugün)</div><div class="stat-value">${data['avg_per_customer_today']:,.2f}</div></div>
+    <div class="stat-tile"><div class="stat-label">Müşteri Başı Ortalama (Bugün)</div><div class="stat-value">${data['avg_per_customer_today']:,.2f}</div>{top_bars['avg']}</div>
+    <div class="stat-tile"><div class="stat-label">Yeni Randevuyla Ayrılan (son 7 gün)</div>
+      <div class="stat-value">{top_bars['rebook_value']}</div>{top_bars['rebook']}</div>
     <div class="stat-tile"><div class="stat-label">Ay-üstü-Ay Büyüme (ay sonu tahmini)</div><div class="stat-value">{fmt_mom(data['mom']['forecast'])}</div>
       {f'<div class="stat-sub">bu ay şimdiye kadar, geçen ayın aynı günlerine göre: {fmt_mom(data["mom"]["mtd"])}</div>' if data['mom']['mtd'] is not None else ''}</div>
   </div>
@@ -1333,6 +1660,8 @@ def render_html(data: dict) -> str:
   <p class="section-title">Bugünkü İşlemler</p>
   <div class="table-wrap"><table><thead><tr><th>Müşteri</th><th>Tutar</th><th>Saat</th></tr></thead>
   <tbody>{txn_rows_html or '<tr><td colspan="3">Henüz işlem yok</td></tr>'}</tbody></table></div>
+
+  {render_today_customers(data.get('actions') or {})}
 
   <p class="section-title">SMS Kırılımı (Bugün)</p>
   <p class="panel-sub">Teslim edildi: operatör mesajın telefona ulaştığını onayladı. Operatöre iletildi: mesaj operatöre geçti ama operatör teslim onayı göndermedi; bazı operatörler hiç göndermez, bu bir hata değildir. Durumlar gönderimden sonraki saatlerde Twilio'dan güncellenir.</p>
@@ -1345,6 +1674,8 @@ def render_html(data: dict) -> str:
     <div class="table-wrap"><table><thead><tr><th>Müşteri</th><th>Telefon</th><th>Neden</th></tr></thead>
     <tbody>{undeliverable_rows or '<tr><td colspan="3">Yok</td></tr>'}</tbody></table></div>
   </details>
+
+  {render_losses_and_campaigns(data.get('actions') or {})}
 
   <p class="section-title">En Yüksek Ciro Yapan 3 Gün (Tüm Zamanlar)</p>
   <div class="top-days">{top_days_html}</div>
@@ -1382,6 +1713,7 @@ def render_html(data: dict) -> str:
 
   <p class="section-title">Aylık Büyüme</p>
   {render_forecast(fc) if fc else ''}
+  {render_week(data.get('actions') or {})}
   {render_forecast_history(data.get('forecast_history') or [])}
 
   <div class="panel">
