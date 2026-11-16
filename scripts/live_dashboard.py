@@ -568,16 +568,35 @@ def render_forecast(fc: dict) -> str:
         f'<div class="stat-value">${fc["actualRevenue"]:,.0f}</div>'
         f'<div class="stat-sub">{fc["daysElapsed"]} / {fc["daysInMonth"]} gün · {fc["actualCustomers"]} müşteri</div></div>'
     )
+    if fc.get("todayTarget"):
+        done = fc["todayRevenue"] / fc["todayTarget"]
+        tiles.append(
+            '<div class="stat-tile"><div class="stat-label">Bugünün hedefi</div>'
+            f'<div class="stat-value">${fc["todayTarget"]:,.0f}</div>'
+            f'<div class="stat-sub">şu ana kadar ${fc["todayRevenue"]:,.0f} · %{done * 100:.0f}'
+            + (" ✓" if done >= 1 else "") + "</div>"
+            f'<div class="fc-bar"><span style="width:{min(100.0, done * 100):.0f}%"></span></div></div>'
+        )
+    expected = fc.get("expectedPerOpenDay")
     if fc["prevRevenue"] and fc["actualRevenue"] >= fc["prevRevenue"]:
         target = f"{prev} cirosu (${fc['prevRevenue']:,.0f}) şimdiden geçildi."
     elif fc["neededPerOpenDay"] is not None:
-        on_pace = fc["recentPerOpenDay"] >= fc["neededPerOpenDay"]
         target = (f"{prev} cirosunu (${fc['prevRevenue']:,.0f}) geçmek için kalan {fc['openDaysLeft']} açık günde "
-                  f"günde ortalama ${fc['neededPerOpenDay']:,.0f} gerekiyor; son 4 haftada açık günlerde günde "
-                  f"ortalama ${fc['recentPerOpenDay']:,.0f} kazanıldı, "
-                  + ("bu tempoyla geçiliyor." if on_pace else "bu tempo yetmiyor."))
+                  f"günde ortalama ${fc['neededPerOpenDay']:,.0f} gerekiyor; tahmin günde ortalama "
+                  f"${expected if expected is not None else fc['recentPerOpenDay']:,.0f} bekliyor. ")
+        if fc.get("gap"):
+            # Rounded up, as in the daily report.
+            visits = f" (~{-(-fc['extraVisits'] // 1):.0f} ek müşteri ziyareti)" if fc.get("extraVisits") else ""
+            target += f"Geçmek için tahminin üstüne ${fc['gap']:,.0f} daha lazım{visits}."
+        else:
+            target += "Bu tempoyla geçiliyor."
     else:
         target = ""
+    y = fc.get("yesterdayTarget")
+    if y and target:
+        hit = y["revenue"] >= y["target"]
+        target += (f" Dün hedef ${y['target']:,.0f} idi, ${y['revenue']:,.0f} yapıldı "
+                   + ("✓." if hit else "✗."))
     accuracy = ""
     if fc["revenueMape"] is not None:
         accuracy = (f" Aralık: aynı yöntem son {len(fc['backtests'])} ayda ayın aynı gününde uygulandığında ay sonunu "
@@ -1096,6 +1115,8 @@ def render_html(data: dict) -> str:
   .wd-empty {{ color: var(--text-muted); }}
   .fc-panel .stat-tile {{ background: var(--surface-1); }}
   .fc-target {{ font-size: 12.5px; margin: 0 0 8px; }}
+  .fc-bar {{ height: 6px; background: var(--grid); border-radius: 3px; margin-top: 6px; overflow: hidden; }}
+  .fc-bar span {{ display: block; height: 100%; background: var(--good); }}
   tr.fc-row td {{ background: #eef6ee; font-style: italic; }}
   tr.fc-row small {{ display: block; font-size: 10.5px; color: var(--text-muted); font-style: normal; }}
   .fch-toggle {{ background: var(--surface-1); flex-wrap: wrap; }}

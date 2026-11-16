@@ -234,11 +234,23 @@ def forecast(daily: Daily, monthly_customers: dict[str, int], today: date,
             [(t["customers"], t["restCustomers"], t["finalCustomers"]) for t in tests
              if t["customers"] is not None and t["finalCustomers"] is not None])
 
-    prev_rev, _ = month_totals(daily, prev)
+    prev_rev, prev_visits = month_totals(daily, prev)
     prev_cust = monthly_customers.get(prev.strftime("%Y-%m"))
     needed = None
     if prev_rev and p["openDaysLeft"]:
         needed = max(0.0, prev_rev - p["actualRevenue"]) / p["openDaysLeft"]
+
+    # Beating last month: how far the forecast falls short, what that is in
+    # visits at last month's revenue per visit, and the day's revenue target.
+    gap = max(0.0, prev_rev - p["revenue"]) if prev_rev else None
+    per_visit = prev_rev / prev_visits if prev_visits else None
+    extra_visits = gap / per_visit if gap and per_visit else (0.0 if gap == 0 else None)
+    yesterday = today - timedelta(days=1)
+    yesterday_target = None
+    if prev_rev and yesterday >= first:
+        target = daily_target(daily, prev_rev, yesterday)
+        if target is not None:
+            yesterday_target = {"day": yesterday, "target": target, "revenue": daily.get(yesterday, (0.0, 0))[0]}
     return {
         "month": month, "asOf": today, "daysElapsed": today.day, "daysInMonth": month_end(today).day,
         "revenue": p["revenue"], "revenueLow": rev_low, "revenueHigh": rev_high, "revenueMape": rev_mape,
@@ -248,4 +260,28 @@ def forecast(daily: Daily, monthly_customers: dict[str, int], today: date,
         "prevMonth": prev.strftime("%Y-%m"), "prevRevenue": prev_rev, "prevCustomers": prev_cust,
         "openDaysLeft": p["openDaysLeft"], "neededPerOpenDay": needed,
         "recentPerOpenDay": p["recentPerOpenDay"], "backtests": tests, "model": model,
+        "expectedPerOpenDay": p["restRevenue"] / p["openDaysLeft"] if p["openDaysLeft"] else None,
+        "gap": gap, "prevRevenuePerVisit": per_visit, "extraVisits": extra_visits,
+        "extraVisitsPerDay": extra_visits / p["openDaysLeft"] if extra_visits and p["openDaysLeft"] else None,
+        "todayTarget": daily_target(daily, prev_rev, today) if prev_rev else None,
+        "todayRevenue": daily.get(today, (0.0, 0))[0],
+        "yesterdayTarget": yesterday_target,
     }
+
+
+def daily_target(daily: Daily, prev_rev: float, day: date) -> float | None:
+    """Revenue the salon needed on day to stay on course to beat last month:
+    what was still missing that morning, spread over the open days from day
+    to month end (weekdays open in the 4 weeks before day). None when day
+    is not usually open, or last month was already beaten that morning."""
+    mean_rev, _ = weekday_means(daily, day)
+    if mean_rev[day.weekday()] <= 0:
+        return None
+    paid = sum(v[0] for d, v in daily.items() if day.replace(day=1) <= d < day)
+    if paid >= prev_rev:
+        return None
+    open_days, d = 0, day
+    while d <= month_end(day):
+        open_days += mean_rev[d.weekday()] > 0
+        d += timedelta(days=1)
+    return (prev_rev - paid) / open_days

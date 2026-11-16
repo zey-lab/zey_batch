@@ -179,6 +179,40 @@ def collect_facts(today: date) -> list[Fact]:
         add("fc.recent_per_open_day", "Son 4 haftada açık günlerde günlük ortalama ciro",
             round(fc["recentPerOpenDay"]), money(fc["recentPerOpenDay"]))
 
+        # The monthly goal: beat last month. How far the forecast falls short,
+        # in dollars and in visits, and how yesterday did against its target.
+        if fc["prevRevenue"] and fc["actualRevenue"] >= fc["prevRevenue"]:
+            add("fc.prev_beaten", f"{prev_name} cirosu ({money(fc['prevRevenue'])}) bu ay şimdiden geçildi; bu ay "
+                "şimdiye kadarki ciro", round(fc["actualRevenue"]), money(fc["actualRevenue"]))
+        if fc.get("expectedPerOpenDay") is not None and fc["openDaysLeft"]:
+            add("fc.expected_per_open_day", f"Tahminin kalan {fc['openDaysLeft']} açık gün için beklediği günlük "
+                "ortalama ciro", round(fc["expectedPerOpenDay"]), money(fc["expectedPerOpenDay"]))
+        if fc.get("gap"):
+            add("fc.gap", f"{prev_name} cirosunu geçmek için {name} ay sonu tahmininin üstüne gereken ek ciro",
+                round(fc["gap"]), money(fc["gap"]))
+            if fc.get("extraVisits"):
+                n = int(-(-fc["extraVisits"] // 1))  # rounded up
+                add("fc.extra_visits", f"Bunun için tahmin edilenin üstüne gereken ek müşteri ziyareti ({prev_name} "
+                    f"ziyaret başı ortalama ciro {money(fc['prevRevenuePerVisit'])} ile)", n, str(n))
+            if fc.get("extraVisitsPerDay"):
+                add("fc.extra_visits_per_day", f"Kalan {fc['openDaysLeft']} açık günde gün başına gereken ek ziyaret",
+                    round(fc["extraVisitsPerDay"], 1), f"{fc['extraVisitsPerDay']:.1f}")
+        elif fc.get("gap") == 0 and fc["prevRevenue"] and fc["actualRevenue"] < fc["prevRevenue"]:
+            add("fc.on_track", f"{name} ay sonu tahmini {prev_name} cirosunu geçiyor; tahmin", round(fc["revenue"]),
+                money(fc["revenue"]))
+        if fc.get("todayTarget"):
+            add("fc.today_target", f"Bugün {prev_name} cirosunu geçme yolunda kalmak için gereken ciro",
+                round(fc["todayTarget"]), money(fc["todayTarget"]))
+        y = fc.get("yesterdayTarget")
+        if y:
+            label = f"Dün ({y['day'].isoformat()})"
+            add("fc.yesterday_target", f"{label} {prev_name} cirosunu geçme yolunda kalmak için gereken ciro",
+                round(y["target"]), money(y["target"]))
+            add("fc.yesterday_revenue", f"{label} yapılan ciro", round(y["revenue"]), money(y["revenue"]))
+            v, d = change(y["revenue"], y["target"])
+            add("fc.yesterday_vs_target", f"{label} yapılan ciro, dünkü hedefe göre", v,
+                d.replace("artış", "üstünde").replace("düşüş", "altında").replace("değişim yok", "hedefle aynı"))
+
     conn = get_connection()
     try:
         def revenue_customers(start: date, end: date) -> tuple[float, int, int]:
@@ -421,6 +455,19 @@ opt-outs and undeliverable numbers are handled automatically every morning; don'
 part -- the only manual step is correcting the numbers listed on the panel in Vagaro. The fc.* facts are a \
 month-end forecast, not results: present them as a forecast ("tahmin ediliyor", "bekleniyor") and, when you \
 give the forecast, its range too. When fc facts exist, the summary says where the month is heading.
+
+The owner's goal every month is to beat the previous month's revenue, so the report is about reaching it:
+- When fc.gap exists, the first watch item is closing that gap: give the gap, the extra visits it takes \
+(fc.extra_visits, fc.extra_visits_per_day) and today's target (fc.today_target). Tie the action to concrete \
+levers the facts show, such as the lapsed customers reachable by SMS (lapsed.*) or few bookings in the next 7 \
+days (next7.*), with numbers from those facts. Merge the other forecast and month-to-date facts into this item \
+instead of writing separate items about the same shortfall.
+- When fc.on_track or fc.prev_beaten exists, the month is heading past last month: say so in good, and say what \
+to keep doing in the summary.
+- When fc.yesterday_* facts exist, say whether yesterday met its target: in good when it did, inside the gap \
+item when it didn't.
+- What is needed per day compares with fc.expected_per_open_day (what the forecast already expects); \
+fc.recent_per_open_day is only the last 4 weeks' average and lags behind a growing business.
 
 Today is {today} (America/Chicago).
 

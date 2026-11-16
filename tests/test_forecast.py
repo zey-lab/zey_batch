@@ -97,6 +97,36 @@ class TestForecast(unittest.TestCase):
         self.assertAlmostEqual(jul["revenue"], 2700.0)  # July: 27 open days x $100
         self.assertEqual(forecast.forecast(daily, monthly_customers, today)["model"], "weekday4")
 
+    def test_gap_to_last_month_in_dollars_visits_and_daily_targets(self) -> None:
+        today = date(2026, 9, 16)  # Wednesday; $30 paid so far today
+        daily = steady_salon(date(2026, 6, 1), today, (30.0, 1))
+        monthly_customers = {"2026-06": 25, "2026-07": 27, "2026-08": 26, "2026-09": 20}
+        # The model expects only $50 a day for the rest of September (15 days).
+        snapshots = {today: {"actualBefore": 1300.0, "days": [50.0] * 15}}
+
+        fc = forecast.forecast(daily, monthly_customers, today, snapshots)
+
+        # $1,330 paid, $20 more today, 14 days x $50: $2,050 against August's $2,600.
+        self.assertAlmostEqual(fc["revenue"], 2050.0)
+        self.assertAlmostEqual(fc["gap"], 550.0)
+        self.assertAlmostEqual(fc["prevRevenuePerVisit"], 50.0)  # $2,600 / 52 visits
+        self.assertAlmostEqual(fc["extraVisits"], 11.0)
+        self.assertAlmostEqual(fc["extraVisitsPerDay"], 11.0 / fc["openDaysLeft"])
+        # Today: $1,300 missing from August's $2,600 over 13 open days left.
+        self.assertAlmostEqual(fc["todayTarget"], 100.0)
+        self.assertAlmostEqual(fc["todayRevenue"], 30.0)
+        # Yesterday (Tuesday): $1,200 missing over 14 open days; $100 paid.
+        y = fc["yesterdayTarget"]
+        self.assertEqual(y["day"], date(2026, 9, 15))
+        self.assertAlmostEqual(y["target"], 1400.0 / 14)
+        self.assertAlmostEqual(y["revenue"], 100.0)
+        # Mondays are closed: no target.
+        self.assertIsNone(forecast.daily_target(daily, 2600.0, date(2026, 9, 14)))
+        # A forecast past last month leaves no gap.
+        fc = forecast.forecast(daily, monthly_customers, today)
+        self.assertEqual(fc["gap"], 0.0)
+        self.assertEqual(fc["extraVisits"], 0.0)
+
     def test_daily_history_uses_the_stored_morning_runs(self) -> None:
         today = date(2026, 9, 3)
         daily = steady_salon(date(2026, 6, 1), today, (0.0, 0))
