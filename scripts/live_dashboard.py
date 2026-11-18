@@ -211,6 +211,28 @@ def fetch_action_data(conn, today: str) -> dict:
     }
 
 
+NO_PAYMENTS_ALERT_HOUR = 13  # Chicago time
+USUALLY_OPEN_REVENUE = 100.0  # a weekday averaging less than this is treated as closed
+
+
+def no_payments_alert(now: datetime, revenue_today: float, expected_today: float | None,
+                      completed_today: int, last_payment_event: datetime | None) -> dict | None:
+    """Warn when a usually open day has no payment by early afternoon: $0
+    alone can't tell a closed day or an early hour from payments that never
+    reach the panel (not checked out in Vagaro, or webhooks not arriving)."""
+    if revenue_today > 0 or now.hour < NO_PAYMENTS_ALERT_HOUR:
+        return None
+    if expected_today is None or expected_today < USUALLY_OPEN_REVENUE:
+        return None
+    return {"expected": expected_today, "completed": completed_today, "lastEvent": last_payment_event}
+
+
+def fetch_last_payment_event(conn) -> datetime | None:
+    row = conn.execute(
+        "SELECT MAX(received_at::timestamptz) AS t FROM webhook_events WHERE event_type = 'transaction'").fetchone()
+    return row["t"] if row else None
+
+
 def fetch_kpi_history(conn) -> list[dict]:
     """Stored daily values (kpi_snapshots); empty if the table doesn't exist."""
     try:
@@ -570,6 +592,7 @@ def fetch_dashboard_data() -> dict:
         overdue = fetch_overdue(conn, today_ct)
         action_rows = fetch_action_data(conn, today_ct)
         kpi_history = fetch_kpi_history(conn)
+        last_payment_event = fetch_last_payment_event(conn)
 
         # Valuable customers who haven't come back yet -- stays on the list
         # until a new transaction updates their last_visit forward, at which
@@ -699,6 +722,23 @@ def fetch_dashboard_data() -> dict:
     for s in series:
         s["visitMix"] = mix.get(s["month"], {})
 
+    # What a normal day like today brings: this morning's model run, else the
+    # same weekday's average over the last 4 weeks.
+    expected_today = None
+    if today in snapshots and snapshots[today]["days"]:
+        expected_today = snapshots[today]["days"][0]
+    elif daily:
+        expected_today = forecast.weekday_means(daily, today)[0][today.weekday()]
+    yesterday = today - timedelta(days=1)
+    yesterday_zero = None
+    if daily and daily.get(yesterday, (0.0, 0))[0] == 0:
+        usual = forecast.weekday_means(daily, yesterday)[0][yesterday.weekday()]
+        if usual >= USUALLY_OPEN_REVENUE:
+            yesterday_zero = {"day": yesterday, "usual": usual}
+    payments_alert = no_payments_alert(
+        datetime.now(ZoneInfo("America/Chicago")), sum(float(r["total_amount"] or 0) for r in txn_today),
+        expected_today, appts_today["done"], last_payment_event)
+
     try:
         actions = build_actions(action_rows, kpi_history, today, month_forecast, snapshots)
     except Exception as exc:  # noqa: BLE001  (the action lists are extras; keep the page up)
@@ -728,6 +768,8 @@ def fetch_dashboard_data() -> dict:
         "forecast": month_forecast,
         "forecast_history": forecast_history,
         "mom": mom,
+        "payments_alert": payments_alert,
+        "yesterday_zero": yesterday_zero,
         "second_visit": second_visit,
         "overdue": overdue,
         "actions": actions,
@@ -1097,6 +1139,23 @@ FORECAST_HISTORY_JS = """
   show(month);
 })();
 """
+
+
+def render_payments_alert(alert: dict | None) -> str:
+    if not alert:
+        return ""
+    last = alert["lastEvent"]
+    last_text = (f"Vagaro'dan son ödeme bildirimi: {last.astimezone(ZoneInfo('America/Chicago')):%d.%m %H:%M} (CT)."
+                 if last else "Vagaro'dan hiç ödeme bildirimi kaydı yok.")
+    done = (f" Takvimde bugün {alert['completed']} tamamlanmış randevu var ama ödemesi görünmüyor."
+            if alert["completed"] else "")
+    return (
+        '<div class="alert-box"><b>⚠️ Bugün Vagaro\'dan hiç ödeme gelmedi.</b> '
+        f"Saat {NO_PAYMENTS_ALERT_HOUR}:00'ü geçti; normalde böyle bir günde ~${alert['expected']:,.0f} ciro "
+        f"oluyor.{done} {last_text} Salon açıksa: müşteriler Vagaro'da checkout ediliyor mu? Ediliyorsa "
+        "Vagaro'nun ödeme bildirimlerinde bir sorun olabilir; panel ve tahmin sadece Vagaro'dan gelen ödemeleri "
+        "görür. Salon bugün kapalıysa bu uyarıyı yok sayın.</div>"
+    )
 
 
 def safe_section(render, *args) -> str:
@@ -1556,6 +1615,8 @@ def render_html(data: dict) -> str:
   .badge {{ font-size: 10px; padding: 2px 6px; border-radius: 5px; white-space: nowrap; }}
   .badge-bad {{ background: #fbe4e4; color: var(--bad); }}
   .badge-new {{ background: #fdf0d5; color: #a87310; }}
+  .alert-box {{ background: #fbe4e4; border-left: 4px solid var(--bad); border-radius: 10px; padding: 12px 14px;
+    margin: 0 0 18px; font-size: 13px; line-height: 1.5; }}
   table.left th, table.left td {{ text-align: left; }}
   td .pb {{ min-width: 90px; }}
   details.collapsible summary {{ cursor: pointer; list-style: none; }}
@@ -1638,6 +1699,7 @@ def render_html(data: dict) -> str:
 <div class="viz-root">
   <h1>Canlı Panel</h1>
   <p class="subtitle">Bugün: {data['today_ct']} (CDT) · her 2 dakikada otomatik güncellenir · üretildi: {datetime.now(ZoneInfo('America/Chicago')).strftime('%H:%M:%S')}</p>
+  {safe_section(render_payments_alert, data.get('payments_alert'))}
 
   <div class="insight-panel">
     <p class="section-title" style="margin-top:0">Durum Değerlendirmesi ve Aksiyon Planı</p>

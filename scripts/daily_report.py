@@ -354,6 +354,14 @@ def collect_facts(today: date) -> list[Fact]:
     add("winback.overdue", "Kendi her zamanki gelme aralığını geçmiş, randevusu olmayan, SMS ile ulaşılabilen düzenli "
         "müşteri (panelde 'Her Zamanki Aralığını Geçen Düzenli Müşteriler' listesi)", len(overdue), str(len(overdue)))
 
+    # A usually open day with no payment at all: closed, or not checked out
+    # in Vagaro -- the numbers above can't tell which.
+    yz = data.get("yesterday_zero")
+    if yz:
+        add("data.yesterday_no_payments", f"Dün ({yz['day'].isoformat()}) Vagaro'da hiç ödeme kaydı yok; son 4 "
+            "haftada aynı gün ortalama ciro (salon kapalıysa normal, açıksa ödemeler Vagaro'da checkout "
+            "edilmemiş olabilir)", round(yz["usual"]), money(yz["usual"]))
+
     # Levers from the panel's action lists (sms_campaign/insights.py).
     acts = data.get("actions") or {}
     if acts.get("visitors"):
@@ -534,6 +542,8 @@ against sms.winback.baseline (how much the win-back texts bring people back; a g
 cancel.lost* (cancellations that never came back) and week.softest_day (the day with the most room to fill).
 - A "visit" (ziyaret) is one customer's payments on one day; a payment row (işlem) is one service. Never mix \
 the two words.
+- When data.yesterday_no_payments exists, add a watch item asking the owner to confirm today whether the salon \
+was closed that day or payments were taken outside Vagaro; don't call it a drop in business.
 - When fc.on_track or fc.prev_beaten exists, the month is heading past last month: say so in good.
 - The summary only describes where things stand; it gives no advice or recommendation ("odaklanılmalı", \
 "sürdürülmeli"): those belong in the watch items' actions. Don't say a trend will continue or is enough.
