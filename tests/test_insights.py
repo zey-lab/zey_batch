@@ -50,6 +50,17 @@ class TestAttachAndToday(unittest.TestCase):
         self.assertIsNone(new["next_booking"])
         self.assertEqual(new["usual_gap"], 35)
 
+    def test_calendar_entries_without_a_service_do_not_break_the_list(self) -> None:
+        today = [
+            {"customer_id": "appt-1", "name": "—", "time": "10:00", "service_name": None, "status": ""},
+            {"customer_id": "reg", "name": "Regular", "time": None, "service_name": None, "status": "Confirmed"},
+        ]
+        history = self.history + [{"customer_id": "reg", "day": D - timedelta(days=5), "service_name": None}]
+        rows = insights.todays_customers(today, history, {}, 35, insights.attach_rates(history))
+        self.assertEqual(len(rows), 1)  # the blocked slot is left out
+        self.assertEqual(rows[0]["services"], ["(hizmet adı yok)"])
+        self.assertEqual(rows[0]["time"], "—")
+
 
 class TestLeakageAndCampaigns(unittest.TestCase):
     def test_a_cancellation_is_lost_only_without_a_visit_within_two_weeks(self) -> None:

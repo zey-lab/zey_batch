@@ -402,6 +402,8 @@ def collect_facts(today: date) -> list[Fact]:
             f"{lm['lines']:.2f}")
         add("visit.lines.prev", f"{pn} ziyaret başına alınan ortalama hizmet sayısı", round(pm["lines"], 2),
             f"{pm['lines']:.2f}")
+        v, d = change(lm["lines"], pm["lines"])
+        add("chg.visit.lines", f"{ln} ziyaret başına alınan hizmet sayısı, {pn} ayına göre", v, d)
         if lm.get("newLines") and lm.get("retLines"):
             add("visit.lines.new", f"{ln} ilk kez gelen müşterilerin ziyaret başına aldığı hizmet sayısı",
                 round(lm["newLines"], 2), f"{lm['newLines']:.2f}")
@@ -532,8 +534,11 @@ against sms.winback.baseline (how much the win-back texts bring people back; a g
 cancel.lost* (cancellations that never came back) and week.softest_day (the day with the most room to fill).
 - A "visit" (ziyaret) is one customer's payments on one day; a payment row (işlem) is one service. Never mix \
 the two words.
-- When fc.on_track or fc.prev_beaten exists, the month is heading past last month: say so in good, and say what \
-to keep doing in the summary.
+- When fc.on_track or fc.prev_beaten exists, the month is heading past last month: say so in good.
+- The summary only describes where things stand; it gives no advice or recommendation ("odaklanılmalı", \
+"sürdürülmeli"): those belong in the watch items' actions. Don't say a trend will continue or is enough.
+- A rise or fall is stated only from a chg.* fact (or another fact that states the comparison), never by \
+comparing two numbers yourself.
 - When fc.yesterday_* facts exist, say whether yesterday met its target: in good when it did, inside the gap \
 item when it didn't.
 - What is needed per day compares with fc.expected_per_open_day (what the forecast already expects); \

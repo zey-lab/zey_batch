@@ -699,7 +699,11 @@ def fetch_dashboard_data() -> dict:
     for s in series:
         s["visitMix"] = mix.get(s["month"], {})
 
-    actions = build_actions(action_rows, kpi_history, today, month_forecast, snapshots)
+    try:
+        actions = build_actions(action_rows, kpi_history, today, month_forecast, snapshots)
+    except Exception as exc:  # noqa: BLE001  (the action lists are extras; keep the page up)
+        print(f"build_actions failed: {exc!r}", file=sys.stderr)
+        actions = {}
 
     revenue_today = sum(float(r["total_amount"] or 0) for r in txn_today)
     customers_today = len({r["cust_key"] for r in txn_today})
@@ -1093,6 +1097,16 @@ FORECAST_HISTORY_JS = """
   show(month);
 })();
 """
+
+
+def safe_section(render, *args) -> str:
+    """One section's error shows in its place instead of taking the page down."""
+    try:
+        return render(*args)
+    except Exception as exc:  # noqa: BLE001
+        print(f"section {render.__name__} failed: {exc!r}", file=sys.stderr)
+        return (f'<p class="panel-sub">Bu bölüm şu an gösterilemiyor ({html.escape(type(exc).__name__)}); '
+                "sayfanın geri kalanı güncel.</p>")
 
 
 def _table(head: list[str], rows: list[list[str]], empty: str = "Yok", cls: str = "") -> str:
@@ -1661,7 +1675,7 @@ def render_html(data: dict) -> str:
   <div class="table-wrap"><table><thead><tr><th>Müşteri</th><th>Tutar</th><th>Saat</th></tr></thead>
   <tbody>{txn_rows_html or '<tr><td colspan="3">Henüz işlem yok</td></tr>'}</tbody></table></div>
 
-  {render_today_customers(data.get('actions') or {})}
+  {safe_section(render_today_customers, data.get('actions') or {})}
 
   <p class="section-title">SMS Kırılımı (Bugün)</p>
   <p class="panel-sub">Teslim edildi: operatör mesajın telefona ulaştığını onayladı. Operatöre iletildi: mesaj operatöre geçti ama operatör teslim onayı göndermedi; bazı operatörler hiç göndermez, bu bir hata değildir. Durumlar gönderimden sonraki saatlerde Twilio'dan güncellenir.</p>
@@ -1675,7 +1689,7 @@ def render_html(data: dict) -> str:
     <tbody>{undeliverable_rows or '<tr><td colspan="3">Yok</td></tr>'}</tbody></table></div>
   </details>
 
-  {render_losses_and_campaigns(data.get('actions') or {})}
+  {safe_section(render_losses_and_campaigns, data.get('actions') or {})}
 
   <p class="section-title">En Yüksek Ciro Yapan 3 Gün (Tüm Zamanlar)</p>
   <div class="top-days">{top_days_html}</div>
@@ -1709,11 +1723,11 @@ def render_html(data: dict) -> str:
     <tbody id="lapsed-body"></tbody></table>
     </div>
   </details>
-  {render_winback(data.get('second_visit') or [], data.get('overdue') or [])}
+  {safe_section(render_winback, data.get('second_visit') or [], data.get('overdue') or [])}
 
   <p class="section-title">Aylık Büyüme</p>
   {render_forecast(fc) if fc else ''}
-  {render_week(data.get('actions') or {})}
+  {safe_section(render_week, data.get('actions') or {})}
   {render_forecast_history(data.get('forecast_history') or [])}
 
   <div class="panel">

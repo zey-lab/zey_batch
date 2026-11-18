@@ -28,7 +28,8 @@ def attach_rates(history: list[dict]) -> dict[str, list[tuple[str, float, int]]]
     history rows: customer_id, day, service_name (completed services)."""
     visits: dict[tuple, set[str]] = defaultdict(set)
     for r in history:
-        visits[(r["customer_id"], r["day"])].add(r["service_name"])
+        if r["service_name"]:
+            visits[(r["customer_id"], r["day"])].add(r["service_name"])
     alone, pairs = Counter(), Counter()
     for services in visits.values():
         for a in services:
@@ -54,11 +55,17 @@ def todays_customers(today_rows: list[dict], history: list[dict], future: dict, 
     after today."""
     past: dict = defaultdict(list)
     for r in history:
-        past[r["customer_id"]].append(r)
+        if r["service_name"]:
+            past[r["customer_id"]].append(r)
     people: dict = {}
-    for r in sorted(today_rows, key=lambda r: r["time"]):
+    for r in sorted(today_rows, key=lambda r: r["time"] or ""):
         if r["status"] in ACTIVE_STATUSES_EXCLUDED:
             continue
+        # Vagaro sometimes has calendar entries with neither a customer nor a
+        # service (e.g. a blocked slot): not a customer.
+        if not r["service_name"] and str(r["customer_id"]).startswith("appt-"):
+            continue
+        r = {**r, "service_name": r["service_name"] or "(hizmet adı yok)", "time": r["time"] or "—"}
         p = people.setdefault(r["customer_id"], {"customer_id": r["customer_id"], "name": r["name"],
                                                   "time": r["time"], "services": [], "done": False})
         if r["service_name"] not in p["services"]:
